@@ -1,0 +1,658 @@
+/*************************************************************************
+ * Copyright (C) [2018] by Cambricon, Inc.
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *************************************************************************/
+#include "plugin_crop_feature_and_resize_macro.h"
+#include "mlu.h"
+
+#ifdef BUILD_MLU100
+#define NRAM_ELEM_CNT (240 * 1024)  // NRAM_ELEM_CNT*2 <= nram.bytes
+#elif BUILD_1H8
+#define NRAM_ELEM_CNT (120 * 1024)  // NRAM_ELEM_CNT*2 <= nram.bytes
+#elif BUILD_1H8MINI
+#define NRAM_ELEM_CNT (60 * 1024)  // NRAM_ELEM_CNT*2 <= nram.bytes
+#else
+#define NRAM_ELEM_CNT (240 * 1024)  // NRAM_ELEM_CNT*2 <= nram.bytes
+#endif
+
+#define ALIGN_UP_TO(x, n) ((((x)-1) / (n) + 1) * (n))
+#define ALIGN_DOWN_TO(x, n) ((((x)-1) / (n) ) * (n))
+
+//#define SCALE 128.0
+#define SCALE 128.0
+#define NORM 100.0
+#define BLOCK 256
+
+/*------------------------------ HELP FUNCTIONS ------------------------------*/
+// currently we do not have max/min functions for scalar integer
+__mlu_func__ half maxInt(half a, half b) {
+  if (a > b)
+    return a;
+  else
+    return b;
+}
+
+__mlu_func__ half minInt(half a, half b) {
+  if (a < b)
+    return a;
+  else
+    return b;
+}
+
+__mlu_func__ void genMaskAndWeights(half* weightX, half* maskX0, half* maskX1,
+                                    half* weightX_align, half* maskX0_align, half* maskX1_align,
+                                    half scaleX_half, int d_col, int s_col,
+                                    int channelOut, int block_align, int mult,
+                                    int roi_x, half x1, int roi_w) {
+  int my_count = 0;
+  half posX = 0;                   // Initial posSrc where posDst = 0
+  half fx = 0.0;                  // fractional part
+  int sx = 0;                     // integer part
+  half wx0 = 0.0;                 // weight for left point
+  half wx1 = 0.0;                 // weight for right point
+  int sxPrev = -1;                // prev integer part
+  int jPrev = 0;                  // the first new j
+  for (int j = 0; j < d_col; j++) {
+    // For each point in dst image, we can uniquely determine
+    // a point in src image. In down-scaling mode, n dst points
+    // has n distict src points, however in up-scaling mode, n dst
+    // points can share 1 src points. This results in the replication
+    // of src image later in the code.
+    posX = maxInt(0, minInt(x1 * (s_col - 1) + j * scaleX_half, s_col - 1)) - roi_x;
+    sx = (unsigned int)posX;
+    fx = posX - (half)sx;
+    wx0 = (((half)1.f - fx) * SCALE);
+    wx1 = (half)SCALE - wx0;
+
+    // In up-scaling mode, we replicate each src row
+    // by a certain number, mult. When generating the mask,
+    // we must know which replication shall we use since they
+    // represent the same pixel. Thus we need a variable to
+    // [recrod the position of first new pixel], i.e., jPrev.
+    jPrev  = j * (sxPrev != sx) + jPrev * (sxPrev == sx);
+    sxPrev = sx;
+    unsigned int offsetW0 = channelOut * j;
+    unsigned int offsetW1 = channelOut * j + d_col * channelOut;
+    unsigned int trueIdx0 = (sx * mult + (j - jPrev)) * channelOut;
+    unsigned int trueIdx1 = ((sx+1) * mult + (j - jPrev)) * channelOut;
+    unsigned int offsetW0_align = block_align * j;
+    unsigned int offsetW1_align = block_align * j + d_col * block_align;
+    unsigned int trueIdx0_align = (sx * mult + (j - jPrev)) * block_align;
+    unsigned int trueIdx1_align = ((sx+1) * mult + (j - jPrev)) * block_align;
+
+    if (channelOut == block_align) {
+      for (int k = 0; k < channelOut; k++) {
+        weightX[offsetW0++] = wx0;
+        weightX[offsetW1++] = wx1;
+        maskX0[trueIdx0++] = 1;
+        maskX1[trueIdx1++] = 1;
+
+        weightX_align[offsetW0_align++] = wx0;
+        weightX_align[offsetW1_align++] = wx1;
+        maskX0_align[trueIdx0_align++] = 1;
+        maskX1_align[trueIdx1_align++] = 1;
+      }
+    } else {
+      for (int k = 0; k < channelOut; k++) {
+        weightX[offsetW0++] = wx0;
+        weightX[offsetW1++] = wx1;
+        maskX0[trueIdx0++] = 1;
+        maskX1[trueIdx1++] = 1;
+      }
+
+      for (int k = 0; k < block_align; k++) {
+        weightX_align[offsetW0_align++] = wx0;
+        weightX_align[offsetW1_align++] = wx1;
+        maskX0_align[trueIdx0_align++] = 1;
+        maskX1_align[trueIdx1_align++] = 1;
+      }
+    }
+  }
+}
+
+// src expansion if mult > 1
+__mlu_func__ void expandInputData(half* src, half* dst, half* tmp_buf,
+                                  int roi_w_pad, int channelOut,
+                                  int mult) {
+  __bang_transpose(tmp_buf, src, roi_w_pad, channelOut);
+  for (int i = 1; i < mult; i++) {
+    __memcpy(tmp_buf + i * roi_w_pad * channelOut, tmp_buf,
+             roi_w_pad * channelOut * sizeof(half), NRAM2NRAM);
+  }
+  __bang_transpose(dst, tmp_buf, channelOut * mult, roi_w_pad);
+}
+
+__mlu_func__ void big_cropandresize_branch(half* src_gdram, half* dst_gdram,
+                         int box_index, int box_count, half y1, half x1,
+                         half y2, half x2, int roi_w, int roi_h, unsigned int scaleX,
+                         unsigned int scaleY, int roi_w_pad, int mult, int batchNum,
+                         int depth, int image_height, int image_width, int crop_height,
+                         int crop_width, int box_number, int depth_align, int buf_size,
+                         half* big_nram_buf, int nram_buf_size, half scaleX_half,
+                         half scaleY_half, int scaleX_up, int scaleY_up,
+                         int x_mode, int y_mode, int box_number_seg, int box_number_slice) {
+  half* nram_buf_end = big_nram_buf + nram_buf_size;
+  half* src = nram_buf_end - 4 * BLOCK;
+  half* weightX = src - 2 * BLOCK;
+
+  half posX = 0;                   // Initial posSrc where posDst = 0
+  half fx = 0.0;                  // fractional part
+  int sx = 0;                     // integer part
+  half wx0 = 0.0;                 // weight for left point
+  half wx1 = 0.0;                 // weight for right point
+
+  for (int i = 0; i < crop_width; i++) {
+    // For each point in dst image, we can uniquely determine
+    // a point in src image. In down-scaling mode, n dst points
+    // has n distict src points, however in up-scaling mode, n dst
+    // points can share 1 src points. This results in the replication
+    // of src image later in the code.
+    posX = maxInt(0, minInt(x1 * (image_width - 1) + i * scaleX_half * x_mode, image_width - 1));
+    sx = (unsigned int)posX;
+    fx = posX - (half)sx;
+    wx0 = (((half)1.f - fx) * SCALE);
+    wx1 = (half)SCALE - wx0;
+
+    __nramset_half(weightX, BLOCK, wx0);
+    __nramset_half(weightX + BLOCK, BLOCK, wx1);
+
+    half posY = 0;
+    half fy = 0.0;
+    int sy = 0;
+    half wy0 = 0.0;
+    half wy1 = 0.0;
+
+    for (int j = 0; j < crop_height; ++j) {
+      posY = maxInt(0, minInt(y1 * (image_height - 1) + j * scaleY_half * y_mode, image_height - 1));
+      sy = (unsigned int)posY;
+      fy = posY - (half)sy;
+      wy0 = (((half)1.f - fy) * SCALE);
+      wy1 = (half)SCALE - wy0;
+
+      for (int loop = 0; loop < depth_align / BLOCK; loop++) {
+        // Load Data
+        int offset_prev = (sy * image_width + sx) * depth + loop * BLOCK;
+        int offset_next = ((sy + 1) * image_width + sx) * depth + loop * BLOCK;
+        unsigned int batch_offset = box_count * image_width * image_height * depth;
+        __memcpy(src, src_gdram + batch_offset + offset_prev, BLOCK * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + BLOCK, src_gdram + batch_offset + offset_prev + depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + 2 * BLOCK, src_gdram + batch_offset + offset_next, BLOCK * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + 3 * BLOCK, src_gdram + batch_offset + offset_next + depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        __bang_mul_const(src, src, 1 / NORM, BLOCK * 4);
+
+        // select data
+        // For example,
+        /* Before:
+         * [Y0X0 Y0X1] ... [Y0X4 Y0X5] ... [Y0X8 Y0X9] ...
+         * [Y1X0 Y1X1] ... [Y1X4 Y1X5] ... [Y1X8 Y1X9] ...
+         *  .    .          .    .          .    .
+         *  .    .          .    .          .    .
+         *
+         * After:
+         * Y0X0 Y0X4 Y0X8 ... Y0X1 Y0X5 Y0X9 ...
+         * Y1X0 Y1X4 Y1X8 ... Y1X1 Y1X5 Y1X9 ...
+         * .    .    .        .    .    .
+         * .    .    .        .    .    .
+         */
+        // Bilinear Interpolation
+        // x_star0 = Y0X0 * wx0 + Y0X1 * wx1
+        __bang_mul(src, src, weightX, BLOCK * 2);
+        __bang_add(src, src, src + BLOCK, BLOCK);
+
+        // x_star1 = Y1X0 * wx0 + Y1X1 * wx1
+        __bang_mul(src + BLOCK * 2, src + BLOCK * 2, weightX, BLOCK * 2);
+        __bang_add(src + BLOCK * 2, src + BLOCK * 2, src + BLOCK * 3, BLOCK);
+
+        // x_star = x_star0 * wy0 + x_star1 * wy1
+        __bang_mul_const(src, src, wy0, BLOCK);
+        __bang_mul_const(src + BLOCK * 2, src + BLOCK * 2, wy1, BLOCK);
+        __bang_add(src, src, src + BLOCK * 2, BLOCK);
+        __bang_mul_const(src, src, 1.0 / SCALE, BLOCK);
+        __bang_mul_const(src, src, 1.0 / SCALE, BLOCK);
+        __bang_mul_const(src, src, NORM, BLOCK);
+
+        // Store Data
+        int dstSize = BLOCK * sizeof(half);
+        half* dst = src;
+        unsigned int multicore_offset = (box_number_slice > 0) ? (box_index + taskDim * box_number_seg) :
+                                                                 (box_index + taskId * box_number_seg);
+        unsigned int batch_crop_offset = multicore_offset * crop_width * crop_height * depth;
+        __memcpy(dst_gdram + batch_crop_offset + j * crop_width * depth + i * depth + loop * BLOCK,
+                 dst, dstSize, NRAM2GDRAM);
+      }
+      if (depth % BLOCK) {
+        int block_align = ((depth_align % BLOCK == 0) ? BLOCK : (depth_align % BLOCK));
+        __bang_write_zero(src, 4 * BLOCK);
+
+        // Load Data
+        int offset_prev = (sy * image_width + sx) * depth + (depth /  BLOCK) * BLOCK;
+        int offset_next = ((sy + 1) * image_width + sx) * depth + (depth / BLOCK) * BLOCK;
+        unsigned int batch_offset = box_count * image_width * image_height * depth;
+        __memcpy(src, src_gdram + batch_offset + offset_prev, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + 1 * BLOCK, src_gdram + batch_offset + offset_prev + depth, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + 2 * BLOCK, src_gdram + batch_offset + offset_next, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        __memcpy(src + 3 * BLOCK, src_gdram + batch_offset + offset_next + depth, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        __bang_mul_const(src, src, 1 / NORM, BLOCK * 4);
+
+        // select data
+        // For example,
+        /* Before:
+         * [Y0X0 Y0X1] ... [Y0X4 Y0X5] ... [Y0X8 Y0X9] ...
+         * [Y1X0 Y1X1] ... [Y1X4 Y1X5] ... [Y1X8 Y1X9] ...
+         *  .    .          .    .          .    .
+         *  .    .          .    .          .    .
+         *
+         * After:
+         * Y0X0 Y0X4 Y0X8 ... Y0X1 Y0X5 Y0X9 ...
+         * Y1X0 Y1X4 Y1X8 ... Y1X1 Y1X5 Y1X9 ...
+         * .    .    .        .    .    .
+         * .    .    .        .    .    .
+         */
+        // Bilinear Interpolation
+        // x_star0 = Y0X0 * wx0 + Y0X1 * wx1
+        __bang_mul(src, src, weightX, BLOCK * 2);
+        __bang_add(src, src, src + BLOCK, BLOCK);
+
+        // x_star1 = Y1X0 * wx0 + Y1X1 * wx1
+        __bang_mul(src + BLOCK * 2, src + BLOCK * 2, weightX, BLOCK * 2);
+        __bang_add(src + BLOCK * 2, src + BLOCK * 2, src + BLOCK * 3, BLOCK);
+
+        // x_star = x_star0 * wy0 + x_star1 * wy1
+        __bang_mul_const(src, src, wy0, BLOCK);
+        __bang_mul_const(src + BLOCK * 2, src + BLOCK * 2, wy1, BLOCK);
+        __bang_add(src, src, src + BLOCK * 2, BLOCK);
+        __bang_mul_const(src, src, 1.0 / SCALE, BLOCK);
+        __bang_mul_const(src, src, 1.0 / SCALE, BLOCK);
+        __bang_mul_const(src, src, NORM, BLOCK);
+
+        // Store Data
+        int dstSize = block_align * sizeof(half);
+        half* dst = src;
+        unsigned int multicore_offset = (box_number_slice > 0) ? (box_index + taskDim * box_number_seg) :
+                                                                 (box_index + taskId * box_number_seg);
+        unsigned int batch_crop_offset = multicore_offset * crop_width * crop_height * depth;
+        __memcpy(dst_gdram + batch_crop_offset +
+                 j * crop_width * depth + i * depth + (depth / BLOCK) * BLOCK,
+                 dst, (depth % BLOCK) * sizeof(half), NRAM2GDRAM);
+      }
+    }
+  }
+}
+
+__mlu_func__ void small_cropandresize_branch(half* src_gdram, half* dst_gdram,
+                         int box_index, int box_count, half y1, half x1,
+                         half y2, half x2, int roi_w, int roi_h, unsigned int scaleX,
+                         unsigned int scaleY, int roi_w_pad, int mult, int batchNum,
+                         int depth, int image_height, int image_width, int crop_height,
+                         int crop_width, int box_number, int depth_align, int buf_size,
+                         half* big_nram_buf, int nram_buf_size, half scaleX_half,
+                         half scaleY_half, int scaleX_up, int scaleY_up,
+                         int box_number_seg, int box_number_slice) {
+  half* nram_buf_end = big_nram_buf + nram_buf_size;
+  int block_align = ((depth_align % BLOCK == 0) ? BLOCK : (depth_align % BLOCK));
+
+  half* weightX = nram_buf_end - crop_width * buf_size * 2;
+  //__bang_collect will set the next 64 number to 0, so I give it 64 more space
+  half* sLine0 = weightX - crop_width * buf_size * 2;
+  half* sLine1 = sLine0 - crop_width * buf_size * 2;
+  half* maskX0 = sLine1 - mult * roi_w_pad * buf_size;
+  half* maskX1 = maskX0 - mult * roi_w_pad * buf_size;
+  half* weightX_align = maskX1 - crop_width * block_align * 2;
+  half* maskX0_align = weightX_align - mult * roi_w_pad * block_align;
+  half* maskX1_align = maskX0_align - mult * roi_w_pad * block_align;
+  half* src = maskX1_align - mult * roi_w_pad * buf_size * 2;
+  half* tmp_buf = src - mult * roi_w_pad * buf_size;
+
+  int roi_x = x1 * (image_width - 1);
+
+  __bang_write_zero(weightX, crop_width * buf_size * 2);
+  __bang_write_zero(maskX0, mult * roi_w_pad * buf_size);
+  __bang_write_zero(maskX1, mult * roi_w_pad * buf_size);
+  __bang_write_zero(weightX_align, crop_width * block_align * 2);
+  __bang_write_zero(maskX0_align, mult * roi_w_pad * block_align);
+  __bang_write_zero(maskX1_align, mult * roi_w_pad * block_align);
+
+  // generate Mask and Weights
+  genMaskAndWeights(weightX, maskX0, maskX1, weightX_align, maskX0_align, maskX1_align,
+                    scaleX_half, crop_width, image_width, buf_size, block_align,
+                    mult, roi_x, x1, roi_w);
+
+  // load two lines and do resize/convert
+  half posY = 0;
+  half fy = 0.0;
+  int sy = 0;
+  half wy0 = 0.0;
+  half wy1 = 0.0;
+  int roi_y = y1 * (image_height - 1);
+  for (int j = 0; j < crop_height; ++j) {
+    posY = maxInt(0, minInt(y1 * (image_height - 1) + j * scaleY_half, image_height - 1));
+    sy = (unsigned int)posY;
+    fy = posY - (half)sy;
+    wy0 = (((half)1.f - fy) * SCALE);
+    wy1 = (half)SCALE - wy0;
+
+    for (int loop = 0; loop < depth_align / BLOCK; loop++) {
+      // Load Data
+      int offset_prev = (sy * image_width + roi_x ) * depth + loop * BLOCK;
+      int offset_next = ((sy + 1) * image_width + roi_x ) * depth + loop * BLOCK;
+      unsigned int batch_offset = box_count * image_width * image_height * depth;
+
+      int size = (roi_w + scaleX_up);
+      if (mult > 1) {
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + m * BLOCK, src_gdram + batch_offset + offset_prev + m * depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        }
+        expandInputData(src, src, tmp_buf, roi_w_pad, BLOCK, mult);
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + mult * (roi_w + scaleX_up) * BLOCK + m * BLOCK, src_gdram + batch_offset + offset_next + m * depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        }
+        expandInputData(src + mult * (roi_w + scaleX_up) * BLOCK,
+                        src + mult * (roi_w + scaleX_up) * BLOCK,
+                        tmp_buf, roi_w_pad, BLOCK, mult);
+        __bang_mul_const(src, src, 1 / NORM, mult * (roi_w + scaleX_up) * BLOCK * 2);
+      } else {
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + m * BLOCK, src_gdram + batch_offset + offset_prev + m * depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        }
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + (roi_w + scaleX_up) * BLOCK + m * BLOCK, src_gdram + batch_offset + offset_next + m * depth, BLOCK * sizeof(half), GDRAM2NRAM);
+        }
+        __bang_mul_const(src, src, 1 / NORM, (roi_w + scaleX_up) * BLOCK * 2);
+      }
+
+      // select data
+      // For example,
+      /* Before:
+       * [Y0X0 Y0X1] ... [Y0X4 Y0X5] ... [Y0X8 Y0X9] ...
+       * [Y1X0 Y1X1] ... [Y1X4 Y1X5] ... [Y1X8 Y1X9] ...
+       *  .    .          .    .          .    .
+       *  .    .          .    .          .    .
+       *
+       * After:
+       * Y0X0 Y0X4 Y0X8 ... Y0X1 Y0X5 Y0X9 ...
+       * Y1X0 Y1X4 Y1X8 ... Y1X1 Y1X5 Y1X9 ...
+       * .    .    .        .    .    .
+       * .    .    .        .    .    .
+       */
+      int maskSize = mult * (roi_w + scaleX_up) * BLOCK;
+      __bang_collect(sLine0, src, maskX0, maskSize);
+      __bang_collect(sLine0 + crop_width * BLOCK, src, maskX1,
+                     maskSize);
+      __bang_collect(sLine1, src + mult * (roi_w + scaleX_up) * BLOCK, maskX0,
+                     maskSize);
+
+      if (box_index == 7 && loop == 0 && j == 0) {
+        // __bang_printf("----shund----sLine0 = %d, sLine1 = %d, maskSize = %d, mult = %d, roi_w = %d, scaleX_up = %d, BLOCK = %d, crop_width = %d\n",sLine0, sLine1, maskSize, mult, roi_w, scaleX_up, BLOCK, crop_width);
+         int tmp = 0;
+         for (int m = 0; m < maskSize; m++) {
+           if (maskX1[m] != 0) {
+             tmp++;
+           }
+         }
+         //__bang_printf("----shund----tmp = %d\n", tmp);
+         //for (int m = 0; m < 128; m++)
+         //   __bang_printf("----m = %d, sLine0 = %hf\n",m,sLine0[m]);
+      }
+//&sLine1(2498304), &sLine0(2529024), maskSize(17920), tmp(7680), crop_width(30), BLOCK(256)
+      __bang_collect(sLine1 + crop_width * BLOCK,
+                     src + mult * (roi_w + scaleX_up) * BLOCK, maskX1, maskSize);
+
+      //if (box_index == 7 && loop == 0 && j == 0) {
+      //  __bang_printf("----shund----sLine0 = %p, sLine1 = %p, maskSize = %d, mult = %d, roi_w = %d, scaleX_up = %d, BLOCK = %d\n",sLine0, sLine1, maskSize, mult, roi_w, scaleX_up, BLOCK);
+      //   for (int m = 0; m < 128; m++)
+      //      __bang_printf("----m = %d, sLine0 = %hf\n",m,sLine0[m]);
+      //}
+
+      // Bilinear Interpolation
+      // x_star0 = Y0X0 * wx0 + Y0X1 * wx1
+      __bang_mul(sLine0, sLine0, weightX, crop_width * BLOCK * 2);
+      __bang_add(sLine0, sLine0, sLine0 + crop_width * BLOCK,
+                 crop_width * BLOCK);
+
+      // x_star1 = Y1X0 * wx0 + Y1X1 * wx1
+      __bang_mul(sLine1, sLine1, weightX, crop_width * BLOCK * 2);
+      __bang_add(sLine1, sLine1, sLine1 + crop_width * BLOCK,
+                 crop_width * BLOCK);
+
+      // x_star = x_star0 * wy0 + x_star1 * wy1
+      __bang_mul_const(sLine0, sLine0, wy0, crop_width * BLOCK);
+      __bang_mul_const(sLine1, sLine1, wy1, crop_width * BLOCK);
+      __bang_add(sLine0, sLine0, sLine1, crop_width * BLOCK);
+      __bang_mul_const(sLine0, sLine0, 1.0 / SCALE, crop_width * BLOCK);
+      __bang_mul_const(sLine0, sLine0, 1.0 / SCALE, crop_width * BLOCK);
+      __bang_mul_const(sLine0, sLine0, NORM, crop_width * BLOCK);
+
+      // Store Data
+      int dstSize = crop_width * BLOCK * sizeof(half);
+      half* dst = sLine0;
+      unsigned int multicore_offset = (box_number_slice > 0) ? (box_index + taskDim * box_number_seg) :
+                                                               (box_index + taskId * box_number_seg);
+      unsigned int batch_crop_offset = multicore_offset * crop_width * crop_height * depth;
+
+      for (int m = 0; m < crop_width; m++) {
+        __memcpy(dst_gdram + batch_crop_offset + j * crop_width * depth + m * depth + loop * BLOCK, dst + m * BLOCK, BLOCK * sizeof(half), NRAM2GDRAM);
+      }
+    }
+
+    if (depth % BLOCK) {
+      // Load Data
+      int offset_prev = (sy * image_width + roi_x ) * depth + (depth / BLOCK) * BLOCK;
+      int offset_next = ((sy + 1) * image_width + roi_x ) * depth + (depth / BLOCK) * BLOCK;
+      unsigned int batch_offset = box_count * image_width * image_height * depth;
+
+      int size = (roi_w + scaleX_up);
+
+      if(mult > 1) {
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + m * block_align, src_gdram + batch_offset + offset_prev + m * depth, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        }
+        expandInputData(src, src, tmp_buf, roi_w_pad, block_align, mult);
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + mult * (roi_w + scaleX_up) * block_align + m * block_align, src_gdram + batch_offset + offset_next + m * depth, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        }
+        expandInputData(src + mult * (roi_w + scaleX_up) * block_align,
+                        src + mult * (roi_w + scaleX_up) * block_align,
+                        tmp_buf, roi_w_pad, block_align, mult);
+        __bang_mul_const(src, src, 1 / NORM, mult * (roi_w + scaleX_up) * block_align * 2);
+      } else {
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + m * block_align, src_gdram + batch_offset + offset_prev + m * depth, (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        }
+        for (int m = 0; m < size; m++) {
+          __memcpy(src + (roi_w + scaleX_up) * block_align + m * block_align,
+                   src_gdram + batch_offset + offset_next + m* depth,
+                   (depth % BLOCK) * sizeof(half), GDRAM2NRAM);
+        }
+        __bang_mul_const(src, src, 1 / NORM, (roi_w + scaleX_up) * block_align * 2);
+      }
+
+      // select data
+      // For example,
+      /* Before:
+       * [Y0X0 Y0X1] ... [Y0X4 Y0X5] ... [Y0X8 Y0X9] ...
+       * [Y1X0 Y1X1] ... [Y1X4 Y1X5] ... [Y1X8 Y1X9] ...
+       *  .    .          .    .          .    .
+       *  .    .          .    .          .    .
+       *
+       * After:
+       * Y0X0 Y0X4 Y0X8 ... Y0X1 Y0X5 Y0X9 ...
+       * Y1X0 Y1X4 Y1X8 ... Y1X1 Y1X5 Y1X9 ...
+       * .    .    .        .    .    .
+       * .    .    .        .    .    .
+       */
+      int maskSize = mult * (roi_w + scaleX_up) * block_align;
+      __bang_collect(sLine0, src, maskX0_align, maskSize);
+      __bang_collect(sLine0 + crop_width * block_align, src, maskX1_align,
+                     maskSize);
+      __bang_collect(sLine1, src + mult * (roi_w + scaleX_up) * block_align, maskX0_align,
+                     maskSize);
+      __bang_collect(sLine1 + crop_width * block_align,
+                     src + mult * (roi_w + scaleX_up) * block_align, maskX1_align, maskSize);
+
+      // Bilinear Interpolation
+      // x_star0 = Y0X0 * wx0 + Y0X1 * wx1
+      __bang_mul(sLine0, sLine0, weightX_align, crop_width * block_align * 2);
+      __bang_add(sLine0, sLine0, sLine0 + crop_width * block_align,
+                 crop_width * block_align);
+
+      // x_star1 = Y1X0 * wx0 + Y1X1 * wx1
+      __bang_mul(sLine1, sLine1, weightX_align, crop_width * block_align * 2);
+      __bang_add(sLine1, sLine1, sLine1 + crop_width * block_align,
+                 crop_width * block_align);
+
+      // x_star = x_star0 * wy0 + x_star1 * wy1
+      __bang_mul_const(sLine0, sLine0, wy0, crop_width * block_align);
+      __bang_mul_const(sLine1, sLine1, wy1, crop_width * block_align);
+      __bang_add(sLine0, sLine0, sLine1, crop_width * block_align);
+      __bang_mul_const(sLine0, sLine0, 1.0 / SCALE, crop_width * block_align);
+      __bang_mul_const(sLine0, sLine0, 1.0 / SCALE, crop_width * block_align);
+      __bang_mul_const(sLine0, sLine0, NORM, crop_width * block_align);
+
+      // Store Data
+      int dstSize = crop_width * block_align * sizeof(half);
+      half* dst = sLine0;
+      unsigned int multicore_offset = (box_number_slice > 0) ? (box_index + taskDim * box_number_seg) :
+                                                               (box_index + taskId * box_number_seg);
+      unsigned int batch_crop_offset = multicore_offset * crop_width * crop_height * depth;
+      for (int m = 0; m < crop_width; m++) {
+        __memcpy(dst_gdram + batch_crop_offset + j * crop_width * depth + m * depth + (depth / BLOCK) * BLOCK, dst + m * block_align, (depth % BLOCK) * sizeof(half), NRAM2GDRAM);
+      }
+    }
+  }
+}
+
+__mlu_entry__ void PluginCropFeatureAndResizeKernel(
+    half* src_gdram, half* boxes_gdram, half* box_index_gdram,
+    half* dst_gdram, int batchNum, int depth,
+    int image_height, int image_width, int crop_height,
+    int crop_width, int box_number, int inputDataType,
+    int outputDataType, int input2half, int output2uint,
+    int pad_size) {
+  __nram__ half big_nram_buf[NRAM_ELEM_CNT];
+  int align_val = pad_size;
+
+
+  int depth_align = ALIGN_UP_TO(depth, align_val);
+  int boxes_channel_align = ALIGN_UP_TO(4, align_val);
+  int buf_size = (depth_align > 256) ? 256 : depth_align;
+  int block_align = ((depth_align % BLOCK == 0) ? BLOCK : (depth_align % BLOCK));
+
+  int box_count = 0;
+  int x_mode = 1, y_mode = 1;
+  half y1, x1, y2, x2, temp, x_width, y_width;
+
+  int box_number_seg = box_number / taskDim;
+  int box_number_slice = box_number % taskDim;
+
+  for (int box_index = 0; box_index < box_number_seg; box_index++) {
+    box_count = box_index_gdram[box_index + taskId * box_number_seg];
+    y1 = boxes_gdram[(box_index + taskId * box_number_seg) * 4 + 0];
+    x1 = boxes_gdram[(box_index + taskId * box_number_seg) * 4 + 1];
+    y2 = boxes_gdram[(box_index + taskId * box_number_seg) * 4 + 2];
+    x2 = boxes_gdram[(box_index + taskId * box_number_seg) * 4 + 3];
+
+    x_width = (x1 < x2) ? (x2 - x1) : (x1 - x2);
+    x_mode = (x1 < x2) ? 1 : -1;
+    y_width = (y1 < y2) ? (y2 - y1) : (y1 - y2);
+    y_mode = (y1 < y2) ? 1 : -1;
+
+    half roi_w_half = x_width * (image_width - 1);
+    half roi_h_half = y_width * (image_height - 1);
+    half scaleX_half = roi_w_half / (crop_width - 1);
+    half scaleY_half = roi_h_half / (crop_height - 1);
+    int roi_w = __half2int_up(roi_w_half);
+    int roi_h = __half2int_up(roi_h_half);
+    int scaleX_up = 3;
+    int scaleY_up = 3;
+    int roi_w_pad = ALIGN_UP_TO(roi_w + scaleX_up, 64);
+    unsigned int scaleX = (roi_w << 16) / (crop_width - 1);
+    unsigned int scaleY = (roi_h << 16) / (crop_height - 1);
+    int mult = (98304 + (scaleX >> 1)) / scaleX + (int)(roi_w > crop_width);
+
+    // Judge using small mode or big mode of cropandresize
+    unsigned int buf_required = crop_width * buf_size * 6 +
+                                mult * roi_w_pad * buf_size * 5 +
+                                crop_width * block_align * 2 +
+                                mult * roi_w_pad * block_align * 2;
+    if ((buf_required <= NRAM_ELEM_CNT) && (x1 < x2) && (y1 < y2)) {
+      small_cropandresize_branch(src_gdram, dst_gdram, box_index, box_count, y1, x1,
+                                 y2, x2, roi_w, roi_h, scaleX, scaleY, roi_w_pad,
+                                 mult, batchNum, depth, image_height, image_width,
+                                 crop_height, crop_width, box_number, depth_align,
+                                 buf_size, big_nram_buf, NRAM_ELEM_CNT,
+                                 scaleX_half, scaleY_half, scaleX_up, scaleY_up,
+                                 box_number_seg, 0);
+    } else {
+      big_cropandresize_branch(src_gdram, dst_gdram, box_index, box_count, y1, x1,
+                               y2, x2, roi_w, roi_h, scaleX, scaleY, roi_w_pad,
+                               mult, batchNum, depth, image_height, image_width,
+                               crop_height, crop_width, box_number, depth_align,
+                               buf_size, big_nram_buf, NRAM_ELEM_CNT,
+                               scaleX_half, scaleY_half, scaleX_up, scaleY_up,
+                               x_mode, y_mode, box_number_seg, 0);
+    }
+  }
+
+  if (box_number_slice > 0) {
+    if (taskId < box_number_slice) {
+      int box_index = taskId;
+      box_count = box_index_gdram[box_index + taskDim * box_number_seg];
+      y1 = boxes_gdram[(box_index + taskDim * box_number_seg) * 4 + 0];
+      x1 = boxes_gdram[(box_index + taskDim * box_number_seg) * 4 + 1];
+      y2 = boxes_gdram[(box_index + taskDim * box_number_seg) * 4 + 2];
+      x2 = boxes_gdram[(box_index + taskDim * box_number_seg) * 4 + 3];
+
+      x_width = (x1 < x2) ? (x2 - x1) : (x1 - x2);
+      x_mode = (x1 < x2) ? 1 : -1;
+      y_width = (y1 < y2) ? (y2 - y1) : (y1 - y2);
+      y_mode = (y1 < y2) ? 1 : -1;
+
+      half roi_w_half = x_width * (image_width - 1);
+      half roi_h_half = y_width * (image_height - 1);
+      half scaleX_half = roi_w_half / (crop_width - 1);
+      half scaleY_half = roi_h_half / (crop_height - 1);
+      int roi_w = __half2int_up(roi_w_half);
+      int roi_h = __half2int_up(roi_h_half);
+      int scaleX_up = 3;
+      int scaleY_up = 3;
+      int roi_w_pad = ALIGN_UP_TO(roi_w + scaleX_up, 64);
+      unsigned int scaleX = (roi_w << 16) / (crop_width - 1);
+      unsigned int scaleY = (roi_h << 16) / (crop_height - 1);
+      int mult = (98304 + (scaleX >> 1)) / scaleX + (int)(roi_w > crop_width);
+
+      // Judge using small mode or big mode of cropandresize
+      unsigned int buf_required = crop_width * buf_size * 6 +
+                                  mult * roi_w_pad * buf_size * 5 +
+                                  crop_width * block_align * 2 +
+                                  mult * roi_w_pad * block_align * 2;
+      if ((buf_required <= NRAM_ELEM_CNT) && (x1 < x2) && (y1 < y2)) {
+        small_cropandresize_branch(src_gdram, dst_gdram, box_index, box_count, y1, x1,
+                                   y2, x2, roi_w, roi_h, scaleX, scaleY, roi_w_pad,
+                                   mult, batchNum, depth, image_height, image_width,
+                                   crop_height, crop_width, box_number, depth_align,
+                                   buf_size, big_nram_buf, NRAM_ELEM_CNT,
+                                   scaleX_half, scaleY_half, scaleX_up, scaleY_up,
+                                   box_number_seg, box_number_slice);
+      } else {
+        big_cropandresize_branch(src_gdram, dst_gdram, box_index, box_count, y1, x1,
+                                 y2, x2, roi_w, roi_h, scaleX, scaleY, roi_w_pad,
+                                 mult, batchNum, depth, image_height, image_width,
+                                 crop_height, crop_width, box_number, depth_align,
+                                 buf_size, big_nram_buf, NRAM_ELEM_CNT,
+                                 scaleX_half, scaleY_half, scaleX_up, scaleY_up,
+                                 x_mode, y_mode, box_number_seg, box_number_slice);
+      }
+    } else {
+      // do nothing
+    }
+  }
+}

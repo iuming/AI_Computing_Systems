@@ -1,0 +1,421 @@
+/*************************************************************************
+ * Copyright (C) [2018] by Cambricon, Inc.
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *************************************************************************/
+#define BATCH 64
+#define BORDER 1
+
+//for float and int_32
+//#define ALIGN_SIZE 8
+#define LIMIT 8
+#define NRAM_ELEM_CNT (120*1024)  // 120 * 32
+#define ALIGN_UP_TO(x, n) ((((x)-1) / (n) + 1) * (n))
+#define ALIGN_SIZE 64
+
+__mlu_entry__ void onehot_kernel(int* indices,
+                                float* dst,
+                                int n,
+                                int h,
+                                int w,
+                                int c,
+                                int depth,
+                                float onvalue,
+                                float offvalue,
+                                int axis) {										
+    int N;
+    int H;
+    int W;
+    int C;
+    N = n;H = h; W = w; C = c;
+    __nram__ float dst_nram[NRAM_ELEM_CNT];
+    int unaligned;
+    int bordnum;
+    int lenthofDst;
+    lenthofDst = N*H*W*C*depth;
+    int iter;
+    iter = lenthofDst / NRAM_ELEM_CNT;
+    int res;
+    res = lenthofDst % NRAM_ELEM_CNT;
+	int res_align = ALIGN_UP_TO(res, ALIGN_SIZE);
+    	
+	//do not support multi cores
+	if(taskId > 0)
+		return ;
+	
+    for(int i=0;i<iter;i++) {
+	  __nramset_float(dst_nram, NRAM_ELEM_CNT, offvalue);
+      __memcpy(dst + i*NRAM_ELEM_CNT, dst_nram, NRAM_ELEM_CNT * sizeof(float), NRAM2GDRAM);
+    }
+
+	if (res > 0) {
+	  __nramset_float(dst_nram, NRAM_ELEM_CNT, offvalue);
+      __memcpy(dst + iter * NRAM_ELEM_CNT, dst_nram, res_align * sizeof(float), NRAM2GDRAM);
+    }
+    
+	if(axis==-1) {
+	  for(int16_t i=0;i<N;i++) {
+		for(int16_t j=0;j<H;j++){
+		  for(int16_t k=0;k<W;k++) {
+			for(int16_t m=0;m<C;m++) {
+			  if(indices[i*W*H*C + j*W*C + k*C + m]>=0 && indices[i*W*H*C + j*W*C + k*C + m]<depth)
+			    dst[i*H*W*C*depth + j*W*C*depth + k*C*depth + m*depth + indices[i*W*H*C + j*W*C + k*C + m]]=onvalue;
+			}
+		  }
+		}
+	  }
+	  return ;
+    }
+	if (axis == 3){
+      for(int16_t i=0;i<N;i++) {
+		for(int16_t j=0;j<H;j++){
+		  for(int16_t k=0;k<W;k++) {
+			for(int16_t m=0;m<C;m++) {
+			  if(indices[i*W*H*C + j*W*C + k*C + m]>=0 && indices[i*W*H*C + j*W*C + k*C + m]<depth){
+				dst[i*H*W*C*depth + j*W*C*depth + k*C*depth + C*indices[i*W*H*C + j*W*C + k*C + m] + m]=onvalue;
+			  }
+			}
+		  }
+		}
+	  }
+	  return ;
+    }
+	if(axis == 2) {
+      for(int16_t i=0;i<N;i++) {
+		for(int16_t j=0;j<H;j++){
+		  for(int16_t k=0;k<W;k++) {
+			for(int16_t m=0;m<C;m++) {
+			  if(indices[i*W*H*C + j*W*C + k*C + m]>=0 && indices[i*W*H*C + j*W*C + k*C + m]<depth){
+				dst[i*H*W*C*depth + j*W*C*depth + W*C*indices[i*W*H*C + j*W*C + k*C + m] + C*k + m]=onvalue;
+			  }
+			}
+		  }
+		}
+	  }
+	  return ;
+    }
+    if(axis == 1) {
+      for(int16_t i=0;i<N;i++) {
+		for(int16_t j=0;j<H;j++){
+		  for(int16_t k=0;k<W;k++) {
+			for(int16_t m=0;m<C;m++) {
+			  if(indices[i*W*H*C + j*W*C + k*C + m]>=0 && indices[i*W*H*C + j*W*C + k*C + m]<depth){
+				dst[i*H*W*C*depth + H*W*C*indices[i*W*H*C + j*W*C + k*C + m] + W*C*j + C*k + m]=onvalue;
+			  }
+			}
+		  }
+	    }
+	  }
+	  return ;
+    }
+    if(axis == 0) {
+      for(int16_t i=0;i<N;i++) {
+		for(int16_t j=0;j<H;j++){
+		  for(int16_t k=0;k<W;k++) {
+			for(int16_t m=0;m<C;m++) {
+			  if(indices[i*W*H*C + j*W*C + k*C + m]>=0 && indices[i*W*H*C + j*W*C + k*C + m]<depth){				 	
+				  dst[H*W*N*C*indices[i*W*H*C + j*W*C + k*C + m] + H*W*C*i + W*C*j + C*k + m]=onvalue;
+			  }
+			}
+		  }
+		}
+	  }
+	  return ;
+    }
+}
+
+//////////////----- c10 --------//////////////////////
+
+//    if(H==1&&W!=1) {
+//       if(axis==-1) {
+//         unaligned=depth%BORDER;
+//         bordnum=depth/BORDER;
+//         if(unaligned>0) {
+//           for(int i=0;i<(BORDER-unaligned)*iter/depth;i++) {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int16_t i=0;i<W;i++) {
+//             for(int16_t j=0;j<C;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[i*C*(bordnum+1)*BORDER+j*(bordnum+1)*BORDER+indices[i*C+j]]=onvalue;
+//             }
+//           }
+//         } else {
+//           for(int16_t i=0;i<W;i++) {
+//             for(int16_t j=0;j<depth;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[i*C*depth+j*depth+indices[i*C+j]]=onvalue;
+//             }
+//           }
+//         }
+//       } else if(axis==0) {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0) {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++) {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<W;i++) {
+//             for(int32_t j=0;j<C;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[i*(bordnum+1)*BORDER*depth+indices[i*C+j]*(bordnum+1)*BORDER+j]=onvalue;
+//             }
+//           }
+//         } else {
+//           for(int32_t i=0;i<W;i++) {
+//             for(int32_t j=0;j<C;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[i*C*depth+indices[i*C+j]*C+j]=onvalue;
+//             }
+//           }
+//         }
+//       } else if(axis==1) {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0) {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++) {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<W;i++) {
+//             for(int32_t j=0;j<C;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[indices[i*C+j]*(bordnum+1)*BORDER*W+i*(bordnum+1)*BORDER+j]=onvalue;
+//             }
+//           }
+//         } else {
+//           for(int32_t i=0;i<W;i++) {
+//             for(int32_t j=0;j<C;j++) {
+//               if(indices[i*C+j]>=0 && indices[i*C+j]<depth)
+//                 dst[indices[i*C+j]*C*W+i*C+j]=onvalue;
+//             }
+//           }
+//         }
+//       }
+//     } else if(W==1) {
+//       if(axis==-1){
+//
+//         //lee
+////         int num = C * BORDER;
+////        float* n[NRAM_ELEM_CNT];
+////        int nram_limit = NRAM_ELEM_CNT;
+////        int repeat = num / nram_limit;
+////        int last = num % nram_limit;
+////        int last_align = ALIGN_UP_TO(last, ALIGN_SIZE);
+////		 __nramset_float(&n, NRAM_ELEM_CNcd T * sizeof(float), offvalue);
+//
+//         unaligned=depth%BORDER;
+//         bordnum=depth/BORDER;
+//         if(unaligned>0) {
+//           for(int i=0;i<(BORDER-unaligned)*iter/depth;i++) {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int i=0;i<C;i++){
+//             if(indices[i]>=0)
+//             {
+//			   __bang_printf("lee, indices %d \n", indices[i]);
+//			   __bang_printf("lee, i*(bordnum+1)*BORDER+indices[i] %d bordum %f \n", i*(bordnum+1)*BORDER+indices[i], bordnum);
+//               dst[i*(bordnum+1)*BORDER+indices[i]]=onvalue;
+//             }
+//           }
+//
+//
+//		   //lee
+//		   for(int i = 0;i < C*BORDER;i++){
+//		   	__bang_printf("lee, dst data %d %f \n", i, dst[i]);
+//		   }
+//
+//
+//         }
+//         else{
+//           for(int32_t i = 0;i < C;i++) {
+//             if(indices[i]>=0 && indices[i]<depth)
+//             {
+//			   __bang_printf("lee, indices %d \n", indices[i]);
+//			   __bang_printf("lee, indices[i]+i*depth %d \n", indices[i]+i*depth);
+//               dst[indices[i]+i*depth] = onvalue;
+//             }
+//           }
+//         }
+//
+//       }
+//       else if(axis==0)
+//       {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0)
+//         {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++)
+//           {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int i=0;i<C;i++)
+//           {
+//             if(indices[i]>=0 && indices[i]<depth)
+//             {
+//               dst[indices[i]*C+i]=onvalue;
+//             }
+//           }
+//         }
+//         else{
+//           for(int32_t i = 0;i < C;i++)
+//             if(indices[i]>=0 && indices[i]<depth)
+//               dst[indices[i]*C+i] =onvalue;
+//         }
+//       }
+//     }
+//     else
+//     {
+//       if(axis==-1)
+//       {
+//         unaligned=depth%BORDER;
+//         bordnum=depth/BORDER;
+//         if(unaligned>0)
+//         {
+//           for(int i=0;i<(BORDER-unaligned)*iter/depth;i++)
+//           {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int32_t k=0;k<C;k++){
+//                   if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                    dst[i*C*W*(bordnum+1)*BORDER+j*C*(bordnum+1)*BORDER+k*(bordnum+1)*BORDER+ indices[i * C * W + j * C + k]]=onvalue;
+//               }
+//             }
+//           }
+//
+//         }
+//         else{
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int32_t k=0;k<C;k++)
+//               {
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                 dst[i * C * W * depth + j * C * depth+k * depth + indices[i * C * W + j * C + k]]=onvalue;
+//               }
+//             }
+//           }
+//         }
+//       }
+//       else if(axis==0)
+//       {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0)
+//         {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++)
+//           {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int k=0;k<C;k++){
+//               if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                   dst[i * (bordnum+1)*BORDER * W * depth + j * (bordnum+1)*BORDER * depth + indices[i * C * W + j * C + k] * (bordnum+1)*BORDER + k]=onvalue;
+//               }
+//             }
+//           }
+//
+//         }
+//         else {
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int32_t k=0;k<C;k++)
+//               {
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                   dst[i * C * W * depth + j * C * depth + indices[i * C * W + j * C + k] * C + k]=onvalue; //0
+
+  //               dst[i * C * W * depth + indices[i * C * W + j * C + k]	* C * W + j * C + k]=onvalue; //1
+//                 dst[i * C * W * depth + j * C * depth+ k * depth + indices[i * C * W + j * C + k]]=onvalue; //-1
+
+//               }
+//             }
+//           }
+//         }
+//       }
+//       else if(axis ==1)
+//       {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0)
+//         {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++)
+//           {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int k=0;k<C;k++){
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                    dst[i * (bordnum+1)*BORDER * W * depth + indices[i * C * W + j * C + k]  * (bordnum+1)*BORDER * W + j * (bordnum+1)*BORDER + k]=onvalue;
+//               }
+//             }
+//           }
+//
+//         }
+//         else{
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int32_t k=0;k<C;k++)
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                   dst[i * C * W * depth + indices[i * C * W + j * C + k]  * C * W + j * C + k]=onvalue;
+//             }
+//           }
+//         }
+//       }
+//       else if(axis==2)
+//       {
+//         unaligned=C%BORDER;
+//         bordnum=C/BORDER;
+//         if(unaligned>0)
+//         {
+//           for(int i=0;i<(BORDER-unaligned)*iter/C;i++)
+//           {
+//             __memcpy(dst+(iter+i)*BATCH,dst_nram,BATCH*sizeof(float),NRAM2GDRAM);
+//           }
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int k=0;k<C;k++){
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                     dst[indices[i * C * W + j * C + k] * (bordnum+1)*BORDER * W * H + i * (bordnum+1)*BORDER * W + j * (bordnum+1)*BORDER + k]=onvalue;
+//               }
+//             }
+//           }
+//
+//         }
+//         else{
+//           for(int32_t i=0;i<H;i++)
+//           {
+//             for(int32_t j=0;j<W;j++)
+//             {
+//               for(int32_t k=0;k<C;k++)
+//                 if(indices[i * C * W + j * C + k]>=0 && indices[i * C * W + j * C + k]<depth)
+//                   dst[indices[i * C * W + j * C + k] * C * W * H + i * C * W + j * C + k]=onvalue;
+//             }
+//           }
+//         }
+//       }
+//     }
+

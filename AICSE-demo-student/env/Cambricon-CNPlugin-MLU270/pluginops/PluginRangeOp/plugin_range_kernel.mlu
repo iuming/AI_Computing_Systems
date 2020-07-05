@@ -1,0 +1,37 @@
+#include "macro_range.h"
+
+__mlu_entry__ void range_kernel(float* start1, float* limit1, float* delta1,
+                               float* output) {
+
+  float start = start1[0];
+  float limit = limit1[0];
+  float delta = delta1[0];
+
+  // only if cpu datatype is equal to mlu datatype, you can use this
+  int size = ceilf((limit - start) / delta);
+
+  // if cpu datatype is not equal to mlu datatype, recommend this
+  // int num = size;
+  
+  __nram__ float n[NRAM_ELEM_CNT];
+  int nram_limit = NRAM_ELEM_CNT;
+  int repeat = size / nram_limit;
+  int last = size % nram_limit;
+  int last_align = last;//ALIGN_UP_TO(last, ALIGN_SIZE);
+
+  for (int i = 0; i < repeat; ++i) {
+    for (int j = 0; j < nram_limit; ++j) {
+      n[j] = start + (i * nram_limit + j) * delta;
+    }
+    __memcpy(output + i * nram_limit, n, nram_limit * sizeof(float), NRAM2GDRAM);
+  }
+  for (int i = 0; i < last; ++i) {
+    n[i] = start + (repeat * nram_limit + i) * delta;
+  }
+
+  if (last > 0) {
+    __memcpy(output + repeat * nram_limit, n, last_align * sizeof(float), NRAM2GDRAM);
+  }
+ 
+ 
+}

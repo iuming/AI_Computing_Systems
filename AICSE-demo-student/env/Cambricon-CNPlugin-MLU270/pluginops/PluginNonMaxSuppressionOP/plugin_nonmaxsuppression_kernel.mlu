@@ -1,0 +1,277 @@
+#define MAX_BOX_LENGTH (25600) // Must > valid(len)/ taskdim
+#define CONST_LENGTH (64) //fixed
+#define OUT_LENGTH (256) //fixed
+#define BOX_SEGMENT (1024) // Best < len/ taskdim a little
+#define SCORE_SEGMENT (1024) // Must < MAX_BOX_LENGTH - 64
+#define SQUEEZE_SEGMENT (20480) //
+//by the way , MAX_BOX_LENGTH must greater than SQUEEZE_SEGMENT
+//#define SEGMENT (256) // fixed
+#define ALIGN(x, n) (((x - 1) / n + 1) * n)
+
+// max(x, y) ~ max(x - y, 0) + y
+__mlu_func__ void __svmax_relu(half* dst, half* src0, half* src1, int len) {
+  __bang_cycle_sub(dst, src0, src1, ALIGN(len, 64), CONST_LENGTH);
+  __bang_active_relu(dst, dst, ALIGN(len, 64));
+  __bang_cycle_add(dst, dst, src1, ALIGN(len, 64), CONST_LENGTH);
+}
+
+// min(x, y) ~ y - max(y - x, 0)
+__mlu_func__ void __svmin_relu(half* dst, half* src0, half* src1, int len) {
+  __bang_cycle_sub(dst, src0, src1, ALIGN(len, 64), CONST_LENGTH);
+  __bang_active_relu(dst, dst, ALIGN(len, 64));
+  __bang_sub(dst, src0, dst, ALIGN(len, 64));
+}
+
+__mlu_entry__ void NonMaxSuppressionKernel(int32_t* out_index, half* box_gdram, half* scores_gdram,
+                       half* const_gdram, half* max_score_gdram,
+                       int len, int max_num, half iou_threshold, half score_threshold) {
+  int32_t core_num = taskDim;
+  int32_t core_id = taskId;
+  __nram__ half box[MAX_BOX_LENGTH * 4];
+  __nram__ half scores[MAX_BOX_LENGTH * 2];
+  __nram__ half inter_area[BOX_SEGMENT];
+  __nram__ half inter_box[BOX_SEGMENT * 4];
+
+  __nram__ half nram_maxx0[CONST_LENGTH];
+  __nram__ half nram_maxy0[CONST_LENGTH];
+  __nram__ half nram_maxx1[CONST_LENGTH];
+  __nram__ half nram_maxy1[CONST_LENGTH];
+  __nram__ half nram_maxarea[CONST_LENGTH];
+
+  __nram__ half result[64];
+  __nram__ half tmp[BOX_SEGMENT];
+
+  __nram__ half temp_for_scores[SQUEEZE_SEGMENT];
+  __nram__ int out_nram[OUT_LENGTH];
+
+  // initialize variables
+  int squeeze_segment_num = (len - 1) / SQUEEZE_SEGMENT + 1; // ceil;
+  int last_squeeze_cpy_length = len % SQUEEZE_SEGMENT ? len % SQUEEZE_SEGMENT : SQUEEZE_SEGMENT;
+  int last_squeeze_segment = ALIGN(last_squeeze_cpy_length, 64);
+  
+  // other variables
+  half rate = 0.125;
+  bool is_scale = false;
+  if (box_gdram[3 * len] > 10.0) {
+    is_scale = true;
+  }
+  //gdram ptr
+  int32_t* squeezed_index_dict = (int32_t*)const_gdram;
+  half* area_gdram = const_gdram + len * 2;
+  half* squeezed_scores_gdram = const_gdram + len * 3;
+  half* squeezed_x0_gdram = const_gdram + len * 4;
+  half* squeezed_y0_gdram = const_gdram + len * 5;
+  half* squeezed_x1_gdram = const_gdram + len * 6;
+  half* squeezed_y1_gdram = const_gdram + len * 7;
+  // nram ptr
+  half* area = scores + MAX_BOX_LENGTH;
+  half* x0 = box;
+  half* y0 = box + MAX_BOX_LENGTH;
+  half* x1 = box + MAX_BOX_LENGTH * 2;
+  half* y1 = box + MAX_BOX_LENGTH * 3;
+  half* inter_x0 = inter_box;
+  half* inter_y0 = inter_box + BOX_SEGMENT;
+  half* inter_x1 = inter_box + BOX_SEGMENT * 2;
+  half* inter_y1 = inter_box + BOX_SEGMENT * 3;
+
+  int32_t pre_offset = 0;
+  int32_t current_offset = 0;
+  if (core_id == 0) {
+    // set out_index as -1
+    __nramset_int(out_nram, OUT_LENGTH, -1);
+    __memcpy(out_index, out_nram, max_num * sizeof(int32_t), NRAM2GDRAM);
+  
+    // squeeze input num 
+    pre_offset = 0;
+    current_offset = 0;
+    half* grater_out = area;
+    float* grater_out_fp32 = (float*)x1;
+    __nramset_half(temp_for_scores, SQUEEZE_SEGMENT, score_threshold);
+    for (int i = 0; i < squeeze_segment_num; i++) {
+      const int squeeze_cpy_len = (i == squeeze_segment_num - 1) ?  last_squeeze_cpy_length: SQUEEZE_SEGMENT;
+      const int squeeze_loop_len = (i == squeeze_segment_num - 1) ?  last_squeeze_segment: SQUEEZE_SEGMENT;
+      if (i == squeeze_segment_num - 1) {
+        __nramset_half(x0, SQUEEZE_SEGMENT, 0);
+      }
+      __memcpy(x0, scores_gdram + i * SQUEEZE_SEGMENT,  squeeze_cpy_len  * sizeof(half), GDRAM2NRAM);
+
+      // grater_out use to store bool value if score is greater than score_threashold
+      // select scores, store in grater_out,
+      __bang_ge(grater_out, x0, temp_for_scores, squeeze_loop_len);
+
+      __bang_select(y0, x0, grater_out, squeeze_loop_len);
+
+      current_offset = ALIGN(((int*)y0)[0], 16);
+      if (current_offset == 0) {
+        continue;
+      }
+      __memcpy(squeezed_scores_gdram + pre_offset, y0 + 64,  current_offset  * sizeof(half), NRAM2GDRAM);
+      //process box x0
+      __memcpy(x0, box_gdram + i * SQUEEZE_SEGMENT,  squeeze_cpy_len  * sizeof(half), GDRAM2NRAM);
+      __bang_collect(y0, x0, grater_out, squeeze_loop_len);
+      __memcpy(squeezed_x0_gdram + pre_offset, y0,  current_offset  * sizeof(half), NRAM2GDRAM);
+      //process box y0
+      __memcpy(x0, box_gdram + i * SQUEEZE_SEGMENT + len,  squeeze_cpy_len  * sizeof(half), GDRAM2NRAM);
+      __bang_collect(y0, x0, grater_out, squeeze_loop_len);
+      __memcpy(squeezed_y0_gdram + pre_offset, y0,  current_offset  * sizeof(half), NRAM2GDRAM);
+      //process box x1
+      __memcpy(x0, box_gdram + i * SQUEEZE_SEGMENT + len * 2,  squeeze_cpy_len  * sizeof(half), GDRAM2NRAM);
+      __bang_collect(y0, x0, grater_out, squeeze_loop_len);
+      __memcpy(squeezed_x1_gdram + pre_offset, y0,  current_offset  * sizeof(half), NRAM2GDRAM);
+      //process box y1
+      __memcpy(x0, box_gdram + i * SQUEEZE_SEGMENT + len * 3,  squeeze_cpy_len  * sizeof(half), GDRAM2NRAM);
+      __bang_collect(y0, x0, grater_out, squeeze_loop_len);
+      __memcpy(squeezed_y1_gdram + pre_offset, y0,  current_offset  * sizeof(half), NRAM2GDRAM);
+      //index
+      __memcpy(x0, squeezed_index_dict + i * SQUEEZE_SEGMENT, squeeze_cpy_len * sizeof(int32_t), GDRAM2NRAM);
+      __bang_half2float(grater_out_fp32, grater_out, squeeze_loop_len);
+      __bang_collect((float*)scores, (float*)x0, grater_out_fp32, squeeze_loop_len);
+      __memcpy(squeezed_index_dict + pre_offset, scores, current_offset  * sizeof(int32_t), NRAM2GDRAM);
+      pre_offset += current_offset;
+    }
+    ((int32_t*)max_score_gdram)[0] = pre_offset;
+  }
+  __sync_all();
+  int squeezed_len = ((int32_t*)max_score_gdram)[0];
+  if (squeezed_len == 0) {
+    return;
+  }
+  //for scores
+  int scores_segment_num = (squeezed_len - 1) / SCORE_SEGMENT + 1; // ceil;
+  int last_scores_cpy_length = squeezed_len % SCORE_SEGMENT ? squeezed_len % SCORE_SEGMENT : SCORE_SEGMENT;
+  int last_scores_segment = ALIGN(last_scores_cpy_length, 64);
+  //for boxes
+  int box_segment_num = (squeezed_len - 1) / BOX_SEGMENT + 1; // ceil
+  int box_loop = box_segment_num / core_num;
+  int last_box_cpy_length = squeezed_len % BOX_SEGMENT ? squeezed_len % BOX_SEGMENT : BOX_SEGMENT;
+  int last_box_segment = ALIGN(last_box_cpy_length, 64);
+  for (int j = 0; j <= box_loop; j++) {
+    int i = j * core_num + core_id;
+    if (i >= box_segment_num) {
+      break;
+    }
+    int loop_len = BOX_SEGMENT;
+    int cpy_len = BOX_SEGMENT;
+    if (i == box_segment_num - 1) {
+      loop_len = last_box_segment;
+      cpy_len = last_box_cpy_length;
+      __nramset_half(scores + j * BOX_SEGMENT, last_box_segment, 0.0);
+    }
+
+    // copy box/scores to nram
+    __memcpy(x0 + j * BOX_SEGMENT, squeezed_x0_gdram + i * BOX_SEGMENT, cpy_len * sizeof(half), GDRAM2NRAM);
+    __memcpy(y0 + j * BOX_SEGMENT, squeezed_y0_gdram + i * BOX_SEGMENT, cpy_len * sizeof(half), GDRAM2NRAM);
+    __memcpy(x1 + j * BOX_SEGMENT, squeezed_x1_gdram + i * BOX_SEGMENT, cpy_len * sizeof(half), GDRAM2NRAM);
+    __memcpy(y1 + j * BOX_SEGMENT, squeezed_y1_gdram + i * BOX_SEGMENT, cpy_len * sizeof(half), GDRAM2NRAM);
+    __memcpy(scores + j * BOX_SEGMENT, squeezed_scores_gdram + i * BOX_SEGMENT, cpy_len * sizeof(half), GDRAM2NRAM);
+    if (is_scale) {
+      __bang_mul_const(x0 + j * BOX_SEGMENT, x0 + j * BOX_SEGMENT, rate, loop_len);
+      __bang_mul_const(y0 + j * BOX_SEGMENT, y0 + j * BOX_SEGMENT, rate, loop_len);
+      __bang_mul_const(x1 + j * BOX_SEGMENT, x1 + j * BOX_SEGMENT, rate, loop_len);
+      __bang_mul_const(y1 + j * BOX_SEGMENT, y1 + j * BOX_SEGMENT, rate, loop_len);
+    }
+    // compute single box area
+    __bang_sub(tmp, x1 + j * BOX_SEGMENT, x0 + j * BOX_SEGMENT, loop_len);
+    __bang_sub(area + j * BOX_SEGMENT, y1 + j * BOX_SEGMENT, y0 + j * BOX_SEGMENT, loop_len);
+    __bang_mul(area + j * BOX_SEGMENT, area + j * BOX_SEGMENT, tmp, loop_len);
+    __bang_active_relu(area + j * BOX_SEGMENT, area + j * BOX_SEGMENT, loop_len);
+    __memcpy(area_gdram + i * BOX_SEGMENT , area + j * BOX_SEGMENT, cpy_len * sizeof(half),
+             NRAM2GDRAM);
+  }
+
+  half max_val = -1.0;
+  int32_t max_idx = 1;
+  for (int k = 0; k < max_num; k++) {
+    // select the max scores one
+    max_val = -1.0;
+    max_idx = 1;
+    int start_1, end_1;
+    if (core_id == 0) {
+      for (int i = 0; i < scores_segment_num; i++) {
+        int scores_loop_len = SCORE_SEGMENT;
+        if (i == scores_segment_num - 1) {
+          scores_loop_len = last_scores_cpy_length;
+          __nramset_half(temp_for_scores, SCORE_SEGMENT, 0);
+        }
+        __memcpy(temp_for_scores, squeezed_scores_gdram + i * SCORE_SEGMENT, scores_loop_len * sizeof(half),
+                 GDRAM2NRAM);
+        __bang_max(result, temp_for_scores, ALIGN(scores_loop_len, 64));
+        if (max_val < result[0]) {
+          max_val = result[0];
+          max_idx = ((uint16_t*)result)[1] + i * SCORE_SEGMENT;
+        }
+      }
+      if (max_val >= score_threshold) {
+        out_index[k] = squeezed_index_dict[max_idx];
+        ((int32_t*)max_score_gdram)[0] = max_idx;
+      }
+    }
+    __sync_all();
+    if (out_index[k] == -1) {
+      break;
+    }
+    int32_t squeezed_idx = ((int32_t*)max_score_gdram)[0];
+    half x0_max = squeezed_x0_gdram[squeezed_idx];
+    half y0_max = squeezed_y0_gdram[squeezed_idx];
+    half x1_max = squeezed_x1_gdram[squeezed_idx];
+    half y1_max = squeezed_y1_gdram[squeezed_idx];
+    half area_max = area_gdram[squeezed_idx];
+    if (is_scale) {
+      x0_max = x0_max * rate;
+      y0_max = y0_max * rate;
+      x1_max = x1_max * rate;
+      y1_max = y1_max * rate;
+    }
+
+    // compuate iou(max box VS others)
+    __nramset_half(nram_maxx0, CONST_LENGTH, x0_max);
+    __nramset_half(nram_maxy0, CONST_LENGTH, y0_max);
+    __nramset_half(nram_maxx1, CONST_LENGTH, x1_max);
+    __nramset_half(nram_maxy1, CONST_LENGTH, y1_max);
+    __nramset_half(nram_maxarea, CONST_LENGTH, area_max);
+
+    for (int j = 0; j <= box_loop; j++) {
+      int i = j * core_num + core_id;
+      if (i >= box_segment_num) {
+        break;
+      }
+      int loop_len = BOX_SEGMENT;
+      int cpy_len = BOX_SEGMENT;
+      if (i == box_segment_num - 1) {
+        loop_len = last_box_segment;
+        cpy_len = last_box_cpy_length;
+      }
+
+      // inter_x0 = max(x0[i], x0[k]);
+      __svmax_relu(inter_x0, x0 + j * BOX_SEGMENT, nram_maxx0, loop_len);
+
+      // inter_y0 = max(y0[i], y0[k]);
+      __svmax_relu(inter_y0, y0 + j * BOX_SEGMENT, nram_maxy0, loop_len);
+
+      // inter_x1 = min(x1[i], x1[k]);
+      __svmin_relu(inter_x1, x1 + j * BOX_SEGMENT, nram_maxx1, loop_len);
+
+      // inter_y1 = min(y1[i], y1[k]);
+      __svmin_relu(inter_y1, y1 + j * BOX_SEGMENT, nram_maxy1, loop_len);
+      // max(0, inter_x1 - inter_x0)
+      __bang_sub(tmp, inter_x1, inter_x0, loop_len);
+      __bang_active_relu(tmp, tmp, loop_len);
+      // max(0, inter_y1 - inter_y0)
+      __bang_sub(inter_area, inter_y1, inter_y0, loop_len);
+      __bang_active_relu(inter_area, inter_area, loop_len);
+
+      // max(0, inter_x1 - inter_x0) * max(0, inter_y1 - inter_y0)
+      __bang_mul(inter_area, tmp, inter_area, loop_len);
+      // (area[i] + area[k] - inter_area) * iou_threshold
+      __bang_cycle_add(tmp, area + j * BOX_SEGMENT, nram_maxarea, loop_len, CONST_LENGTH);
+      __bang_sub(tmp, tmp, inter_area, loop_len);
+      __bang_mul_const(tmp, tmp, iou_threshold, loop_len);
+      // (area[i] + area[k] - inter_area) * iou_threshold > inter_area
+      __bang_ge(tmp, tmp, inter_area, loop_len);
+      __bang_mul(scores + j * BOX_SEGMENT, scores + j * BOX_SEGMENT, tmp, loop_len);
+      __memcpy(squeezed_scores_gdram + i * BOX_SEGMENT, scores + j * BOX_SEGMENT, cpy_len * sizeof(half),
+               NRAM2GDRAM);
+    }
+    __sync_all();
+  }
+}

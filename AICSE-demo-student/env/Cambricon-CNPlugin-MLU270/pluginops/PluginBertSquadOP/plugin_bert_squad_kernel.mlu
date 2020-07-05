@@ -1,0 +1,2381 @@
+/*************************************************************************
+ * Copyright (C) [2018] by Cambricon, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *************************************************************************/
+
+#include "mlu.h"
+#include "mlisa_util.h"
+#include "bert_squad_config.h"
+
+#define CHECK_LAYER 11
+
+//#define COLLECT_LAYER_RUNTIME
+
+// NRAM buffer for fix positions
+__nram__ unsigned char nram_fix_pos[NUM_FIXPOS];
+
+// A unified NRAM buffer for various computations
+__nram__ half nram_buf[NRAM_BUF_SIZE_IN_HALF];
+
+// A unified SRAM buffer for various purposes
+__mlu_shared__ half sram_buf[SRAM_BUF_SIZE_IN_HALF];
+
+// WRAM buffer for local kernel matrix
+__wram__ int16 wram_buf[WRAM_BUF_SIZE_IN_FIX16];
+
+
+__mlu_entry__ void bertSquadKernel(float* start_logits,
+                                   float* end_logits,
+                                   int* input_ids,
+                                   int* token_type_ids,
+                                   half* attention_mask,
+                                   float* word_embedding_table,
+                                   float* segment_embedding_table,
+                                   float* position_embedding_table,
+                                   float* embedding_layernorm_beta,
+                                   float* embedding_layernorm_gamma,
+                                   int16* post_output_kernel,
+                                   float* post_output_bias,
+                                   int16* attr_kernel_Q_ch0,
+                                   int16* attr_kernel_Q_ch1,
+                                   int16* attr_kernel_Q_ch2,
+                                   int16* attr_kernel_Q_ch3,
+                                   half*  attr_bias_Q,
+                                   int16* attr_kernel_K_ch0,
+                                   int16* attr_kernel_K_ch1,
+                                   int16* attr_kernel_K_ch2,
+                                   int16* attr_kernel_K_ch3,
+                                   half*  attr_bias_K,
+                                   int16* attr_kernel_V_ch0,
+                                   int16* attr_kernel_V_ch1,
+                                   int16* attr_kernel_V_ch2,
+                                   int16* attr_kernel_V_ch3,
+                                   half*  attr_bias_V,
+                                   int16* attr_output_kernel_ch0,
+                                   int16* attr_output_kernel_ch1,
+                                   int16* attr_output_kernel_ch2,
+                                   int16* attr_output_kernel_ch3,
+                                   half*  attr_output_bias,
+                                   half*  attr_layernorm_beta,
+                                   half*  attr_layernorm_gamma,
+                                   int16* inter_kernel_ch0,
+                                   int16* inter_kernel_ch1,
+                                   int16* inter_kernel_ch2,
+                                   int16* inter_kernel_ch3,
+                                   half*  inter_bias,
+                                   int16* output_kernel_ch0,
+                                   int16* output_kernel_ch1,
+                                   int16* output_kernel_ch2,
+                                   int16* output_kernel_ch3,
+                                   half*  output_bias,
+                                   half*  output_layernorm_beta,
+                                   half*  output_layernorm_gamma,
+                                   unsigned char* fix_pos,
+                                   int batch_num,
+                                   int input_seq_len)
+{
+  // Declaration of predicate registers
+  __asm__ volatile(".pred %pr<10>;\n\t");
+  const int dst_cluster_id = ((clusterId + 3) & 3);
+  #ifdef COLLECT_LAYER_RUNTIME
+  uint32_t tick_ss = 0;
+  uint32_t tick_ee = 0;
+  #endif
+
+  { // Word embedding for bert input tensor
+    // load segment embedding table
+    float* nram_embed_buf = (float*) (&nram_buf[0]);
+    __mlvm_memcpy_gdram_to_nram_async(nram_embed_buf + NRAM_SEG_TABLE, segment_embedding_table,
+                                      SEGMENT_SIZE * HIDDEN_DIM * sizeof(float));
+    __mlvm_memcpy_gdram_to_nram_async(nram_embed_buf + NRAM_EMLN_BETA_BUF, embedding_layernorm_beta,
+                                      sizeof(float) * HIDDEN_DIM);
+    __mlvm_memcpy_gdram_to_nram_async(nram_embed_buf + NRAM_EMLN_GAMMA_BUF,
+                                      embedding_layernorm_gamma,
+                                      sizeof(float) * HIDDEN_DIM);
+    mlisa_sync();
+    int global_core_id = CLUSTER_DIM * clusterId + coreId;
+    int* nram_input_id_buf = (int*) (&nram_embed_buf[NRAM_INPUT_ID_BUF]);
+    int* nram_token_id_buf = (int*) (&nram_embed_buf[NRAM_TOKEN_ID_BUF]);
+    for (int i = 0; i < batch_num; i ++) {
+      int id_offset = SEQ_PER_CORE * global_core_id;
+      int batch_offset = i * SEQ_PER_CORE * HIDDEN_DIM;
+      __mlvm_memcpy_gdram_to_nram_async(nram_input_id_buf,
+                                        input_ids + i * SEQ_LEN + id_offset,
+                                        sizeof(int) * SEQ_PER_CORE);
+      __mlvm_memcpy_gdram_to_nram_async(nram_token_id_buf,
+                                        token_type_ids + i * SEQ_LEN + id_offset,
+                                        sizeof(int) * SEQ_PER_CORE);
+      mlisa_sync();
+      __mlvm_memcpy_gdram_to_nram_async(nram_embed_buf + NRAM_EMLN_TSR_BUF + batch_offset,
+                                        position_embedding_table + id_offset * HIDDEN_DIM,
+                                        sizeof(float) * SEQ_PER_CORE * HIDDEN_DIM);
+      for (int cur_word = 0; cur_word < SEQ_PER_CORE; cur_word ++) {
+        int word_id = nram_input_id_buf[cur_word];
+        int seg_id = nram_token_id_buf[cur_word];
+        __memcpy(nram_embed_buf + NRAM_WORD_BUF0,
+                 word_embedding_table + word_id * HIDDEN_DIM,
+                sizeof(float) * HIDDEN_DIM, GDRAM2NRAM);
+        __bang_add(nram_embed_buf + NRAM_EMLN_FP32_BUF + batch_offset + cur_word * HIDDEN_DIM,
+                   nram_embed_buf + NRAM_WORD_BUF0,
+                   nram_embed_buf + NRAM_SEG_TABLE + seg_id * HIDDEN_DIM, HIDDEN_DIM);
+      }
+    }
+    int task_size = TENSOR_SIZE / TOTAL_CORES * batch_num;
+    int channel_size = SEQ_LEN / 4;
+    int cycle_size = TENSOR_SIZE / 4;
+    if (batch_num > 4) {
+      channel_size = SEQ_LEN / 2;
+      cycle_size = TENSOR_SIZE / 2;
+    }
+    __bang_add(nram_embed_buf + NRAM_EMLN_TSR_BUF,
+               nram_embed_buf + NRAM_EMLN_TSR_BUF,
+               nram_embed_buf + NRAM_EMLN_FP32_BUF, task_size);
+    __bang_transpose(nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_TSR_BUF, channel_size, HIDDEN_DIM);
+    __bang_avgpool(nram_embed_buf + NRAM_EMLN_MEAN_BUF,
+                   nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                   channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+    __bang_cycle_sub(nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_MEAN_BUF,
+                     cycle_size, channel_size);
+    __bang_square(nram_embed_buf + NRAM_EMLN_FP32_VAR_BUF,
+                  nram_embed_buf + NRAM_EMLN_FP32_BUF, cycle_size);
+    __bang_avgpool(nram_embed_buf + NRAM_EMLN_SVAR_BUF,
+                   nram_embed_buf + NRAM_EMLN_FP32_VAR_BUF,
+                   channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+    __bang_active_rsqrt(nram_embed_buf + NRAM_EMLN_SVAR_BUF,
+                          nram_embed_buf + NRAM_EMLN_SVAR_BUF, channel_size);
+    __bang_cycle_mul(nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_SVAR_BUF,
+                     cycle_size, channel_size);
+    __bang_transpose(nram_embed_buf + NRAM_EMLN_TSR_BUF,
+                     nram_embed_buf + NRAM_EMLN_FP32_BUF, HIDDEN_DIM, channel_size);
+    __bang_cycle_mul(nram_embed_buf + NRAM_EMLN_TSR_BUF,
+                     nram_embed_buf + NRAM_EMLN_TSR_BUF,
+                     nram_embed_buf + NRAM_EMLN_GAMMA_BUF,
+                     task_size, HIDDEN_DIM);
+    __bang_cycle_add(nram_embed_buf + NRAM_EMLN_FP32_BUF,
+                     nram_embed_buf + NRAM_EMLN_TSR_BUF,
+                     nram_embed_buf + NRAM_EMLN_BETA_BUF,
+                     task_size, HIDDEN_DIM);
+    __bang_float2half_rd(nram_buf + NRAM_HTSR_BUF0,
+                         nram_embed_buf + NRAM_EMLN_FP32_BUF, task_size);
+    mlisa_sync();
+    __memcpy(wram_buf + WRAM_TENSOR_BUF, nram_buf + NRAM_HTSR_BUF0,
+             sizeof(half) * TENSOR_SIZE / TOTAL_CORES * batch_num, NRAM2WRAM);
+    __memcpy(nram_fix_pos, fix_pos, sizeof(unsigned char) * (NUM_FIXPOS), GDRAM2NRAM);
+    int fix_pos0 = -nram_fix_pos[0];
+    __bang_half2int16_rd((int16*) (nram_buf + NRAM_HTSR_BUF0), nram_buf + NRAM_HTSR_BUF0,
+                         TENSOR_SIZE / TOTAL_CORES * batch_num, fix_pos0);
+    for (int i = 0; i < batch_num; i ++) {
+      int task_offset = SEQ_PER_CORE * HIDDEN_DIM * coreId;
+      __memcpy(sram_buf + SRAM_TSR_BUF2 + task_offset + i * TENSOR_SIZE / CLUSTER_DIM,
+               nram_buf + NRAM_HTSR_BUF0 + i * SEQ_PER_CORE * HIDDEN_DIM,
+               sizeof(half) * TENSOR_SIZE / TOTAL_CORES, NRAM2SRAM);
+    }
+    // Load attention masks and save them into wram
+    //__memcpy(nram_embed_buf + NRAM_EMLN_FP32_BUF, attention_mask,
+    //         sizeof(float) * SEQ_LEN * batch_num, GDRAM2NRAM);
+    //__bang_float2half_rd(nram_buf + NRAM_MASK_BUF,
+    //                     nram_embed_buf + NRAM_EMLN_FP32_BUF, SEQ_LEN * batch_num);
+    //__memcpy(wram_buf + WRAM_MASK_BUF, nram_buf + NRAM_MASK_BUF,
+    //         sizeof(half) * SEQ_LEN * batch_num, NRAM2WRAM);
+    __memcpy(wram_buf + WRAM_MASK_BUF, attention_mask,
+             sizeof(half) * SEQ_LEN * batch_num, GDRAM2WRAM);
+    mlisa_barrier_cluster();
+
+    if (batch_num >= 1) {
+      __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2, sizeof(half) * TENSOR_SIZE / 4,
+               SRAM2SRAM, 0);
+    }
+    if (batch_num >= 2) {
+      __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 1);
+    }
+    if (batch_num >= 3) {
+      __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + 2 * TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 2);
+    }
+    if (batch_num >= 4) {
+      __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + 3 * TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 3);
+    }
+    if (batch_num >= 5) {
+      __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + TENSOR_SIZE,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 0);
+    }
+    if (batch_num >= 6) {
+      __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + 5 * TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 1);
+    }
+    if (batch_num >= 7) {
+      __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + 6 * TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 2);
+    }
+    if (batch_num == 8) {
+      __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+               sram_buf + SRAM_TSR_BUF2 + 7 * TENSOR_SIZE / 4,
+               sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 3);
+    }
+  } // End of word embedding
+
+  int16* query_kernel_gdram_ptr  = NULL;
+  int16* key_kernel_gdram_ptr    = NULL;
+  int16* value_kernel_gdram_ptr  = NULL;
+  int16* attout_kernel_gdram_ptr = NULL;
+  int16* inter_kernel_gdram_ptr  = NULL;
+  int16* output_kernel_gdram_ptr = NULL;
+
+  switch(clusterId) {
+    case 0:
+      query_kernel_gdram_ptr  = attr_kernel_Q_ch0 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      key_kernel_gdram_ptr    = attr_kernel_K_ch0 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      value_kernel_gdram_ptr  = attr_kernel_V_ch0 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      attout_kernel_gdram_ptr = attr_output_kernel_ch0 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      inter_kernel_gdram_ptr  = inter_kernel_ch0 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      output_kernel_gdram_ptr = output_kernel_ch0 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      break;
+    case 1:
+      query_kernel_gdram_ptr  = attr_kernel_Q_ch1 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      key_kernel_gdram_ptr    = attr_kernel_K_ch1 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      value_kernel_gdram_ptr  = attr_kernel_V_ch1 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      attout_kernel_gdram_ptr = attr_output_kernel_ch1 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      inter_kernel_gdram_ptr  = inter_kernel_ch1 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      output_kernel_gdram_ptr = output_kernel_ch1 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      break;
+    case 2:
+      query_kernel_gdram_ptr  = attr_kernel_Q_ch2 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      key_kernel_gdram_ptr    = attr_kernel_K_ch2 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      value_kernel_gdram_ptr  = attr_kernel_V_ch2 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      attout_kernel_gdram_ptr = attr_output_kernel_ch2 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      inter_kernel_gdram_ptr  = inter_kernel_ch2 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      output_kernel_gdram_ptr = output_kernel_ch2 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      break;
+    case 3:
+      query_kernel_gdram_ptr  = attr_kernel_Q_ch3 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      key_kernel_gdram_ptr    = attr_kernel_K_ch3 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      value_kernel_gdram_ptr  = attr_kernel_V_ch3 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      attout_kernel_gdram_ptr = attr_output_kernel_ch3 + coreId * HEAD_SIZE * HIDDEN_DIM;
+      inter_kernel_gdram_ptr  = inter_kernel_ch3 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      output_kernel_gdram_ptr = output_kernel_ch3 + coreId * 3 * HEAD_SIZE * HIDDEN_DIM;
+      break;
+    default:
+      query_kernel_gdram_ptr = NULL;
+      key_kernel_gdram_ptr   = NULL;
+      value_kernel_gdram_ptr = NULL;
+      attout_kernel_gdram_ptr = NULL;
+      inter_kernel_gdram_ptr = NULL;
+      output_kernel_gdram_ptr = NULL;
+      break;
+  }
+
+  { // Prepare data for the first encoder
+    // Load model data into WRAM and NRAM
+    if (coreId < 3) {
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_Q_BUF,
+                                        query_kernel_gdram_ptr,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_Q_BUF + HEAD_SIZE * HIDDEN_DIM/4/64,
+                                        query_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/4,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_Q_BUF + HEAD_SIZE * HIDDEN_DIM/2/64,
+                                        query_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/2,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_Q_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 3/4/64,
+                                        query_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 3/4,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF,
+                                        key_kernel_gdram_ptr,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF + HEAD_SIZE * HIDDEN_DIM/8/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/8,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF + HEAD_SIZE * HIDDEN_DIM/4/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/4,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 3/8/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 3/8,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM/2/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/2,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 5/8/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 5/8,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 6/8/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 6/8,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_K_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 7/8/64,
+                                        key_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 7/8,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_V_BUF,
+                                        value_kernel_gdram_ptr,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_V_BUF + HEAD_SIZE * HIDDEN_DIM/4/64,
+                                        value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/4,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_V_BUF + HEAD_SIZE * HIDDEN_DIM/2/64,
+                                        value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/2,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __mlvm_memcpy_gdram_to_wram_async(wram_buf + WRAM_KERNEL_V_BUF +
+                                        HEAD_SIZE * HIDDEN_DIM * 3/4/64,
+                                        value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 3/4,
+                                        HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+    }
+    query_kernel_gdram_ptr += HEAD_SIZE * HIDDEN_DIM;
+    key_kernel_gdram_ptr += HEAD_SIZE * HIDDEN_DIM;
+  }
+  mlisa_barrier_all();
+
+  #ifdef COLLECT_LAYER_RUNTIME
+  // Collect checkpoint time
+  mlisa_barrier_all();
+  tick_ss = mlisa_get_tck_low();
+  #endif
+
+  for (int cur_layer = 0; cur_layer < CHECK_LAYER + 1; cur_layer ++)
+  {
+    { // Produce query, key and value
+      if (coreId < 3) {
+        int bias_offset = (clusterId * 3 + coreId) * HEAD_SIZE;
+        __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_BIAS_BUF_Q, attr_bias_Q + bias_offset,
+                                          sizeof(half) * HEAD_SIZE);
+        __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_BIAS_BUF_K, attr_bias_K + bias_offset,
+                                          sizeof(half) * HEAD_SIZE);
+        __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_BIAS_BUF_V, attr_bias_V + bias_offset,
+                                          sizeof(half) * HEAD_SIZE);
+      }
+      mlisa_barrier_all();
+      // Send the input tensor in the first buffer to the previous cluster
+      __mlvm_memcpy_sram_to_sram(sram_buf + SRAM_TSR_BUF2, sram_buf + SRAM_TSR_BUF0,
+                                 sizeof(half) * HALF_TENSOR_SIZE, dst_cluster_id);
+      // Broadcast tensor from SRAM to IPU0-IPU2 NRAM, the mask is 0x7
+      mlisa_setpred_eqi_PR0(coreId, 3);
+      mlisa_attr_multicast_tensor_PR0(nram_buf + NRAM_HTSR_BUF0, sram_buf + SRAM_TSR_BUF0,
+                                      sizeof(half) * HALF_TENSOR_SIZE);
+
+      // Produce queries, keys and values
+      int nram_htsr_offset = NRAM_HTSR_BUF0;
+      int sram_recv_offset = SRAM_TSR_BUF2;
+      int sram_exld_offset = SRAM_TSR_BUF0; // offset of tensor prefetch and exchange
+
+      int16* inter_kernel_wram_ptr = wram_buf + WRAM_KERNEL_INTER_BUF;
+
+      int num_iters = 8;
+      if (batch_num > 4) {
+        num_iters = 16;
+      }
+
+      if (coreId == MEM_CORE) {
+        // Memcore is responsible for exchanging tensors
+        for (int step = 0; step < num_iters; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          mlisa_barrier_all();
+          int cond_pr0 = ((step < num_iters - 1) && ((step & 1) == 0) && (step != 6));
+          int cond_pr1 = ((step < num_iters - 1) && ((step & 1) == 1) && (step != 5));
+          mlisa_setpred_eqi_PR0(cond_pr0, 1);
+          mlisa_tensor_exchange_StoS_async_PR0(sram_buf + sram_recv_offset + HALF_TENSOR_SIZE,
+                                               sram_buf + sram_exld_offset + HALF_TENSOR_SIZE,
+                                               sizeof(half) * HALF_TENSOR_SIZE, dst_cluster_id);
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_tensor_exchange_StoS_async_PR1(sram_buf + sram_recv_offset,
+                                               sram_buf + sram_exld_offset,
+                                               sizeof(half) * HALF_TENSOR_SIZE, dst_cluster_id);
+          // Switch SRAM buffers for next iteration
+          if(step != 6) {
+            if((step & 1) == 0) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }
+          } else if (batch_num > 4 && step == 6) {
+            sram_exld_offset = SRAM_TSR_BUF1;
+            sram_recv_offset = SRAM_TSR_BUF2;
+          }
+        }
+      } else if (coreId < 3) {
+        int16* attout_kernel_wram_ptr = wram_buf + WRAM_KERNEL_ATTOUT_BUF;
+        /*int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 0]; //Q mlp
+        int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 1]; //Q out
+        int fix_pos2 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 2]; //V mlp
+        int fix_pos3 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 3]; //V out
+        int fix_pos4 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 4]; //K mlp
+        int fix_pos5 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 5]; //K out*/
+        int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 1]; //Q mlp
+        int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 2]; //Q out
+        int fix_pos2 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 3]; //V mlp
+        int fix_pos3 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 4]; //V out
+        int fix_pos4 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 5]; //K mlp
+        int fix_pos5 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 6]; //K out
+        // QK result NRAM buffer
+        int nram_qk_offset_cur = NRAM_QK_BUF0;
+        int nram_qk_offset_prev;
+        int nram_v_offset_cur  = NRAM_V_BUF0;
+        int nram_v_offset_prev = NRAM_V_BUF1;
+        int qkv_sram_offset = 0;
+        int pre_batch;
+        // Produce the QKV layer
+        for (int step = 0; step < num_iters; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          mlisa_barrier_all();
+          int cur_batch = ((clusterId + ((step >> 1) & 3)) & 3) + ((step >> 3) << 2);
+          int cond_pr1 = (step >= 1 && ((step & 1) == 1) && cur_batch <= batch_num);
+          int cond_pr2 = (step >= 1 && ((step & 1) == 1) && pre_batch <= batch_num);
+          int cond_pr3 = (step >= 1 && ((step & 1) == 0) && pre_batch <= batch_num);
+          int cond_pr4 = (step >= 2 && ((step & 1) == 0) && pre_batch <= batch_num);
+          mlisa_setpred_le_PR0(cur_batch, batch_num);
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_setpred_eqi_PR2(cond_pr2, 1);
+          mlisa_setpred_eqi_PR3(cond_pr3, 1);
+          mlisa_setpred_eqi_PR4(cond_pr4, 1);
+          // Produce values and transpose (using qk buffer for intermediate result)
+          mlisa_attr_mlp_PR0(nram_buf + nram_v_offset_cur,
+                             (int16*) nram_buf + nram_htsr_offset,
+                             wram_buf + WRAM_KERNEL_V_BUF,
+                             nram_buf + NRAM_BIAS_BUF_V, fix_pos2);
+          mlisa_transpose_PR1(nram_buf + nram_qk_offset_cur,
+                              nram_buf + nram_v_offset_cur - SEQ_LEN * HEAD_SIZE / 2,
+                              SEQ_LEN, HEAD_SIZE);
+          mlisa_half2int16_rd_PR1((int16*) nram_buf + nram_v_offset_cur -
+                                  SEQ_LEN * HEAD_SIZE / 2,
+                                  nram_buf + nram_qk_offset_cur,
+                                  SEQ_LEN * HEAD_SIZE, fix_pos3);
+          // Produce queries
+          mlisa_attr_mlp_PR0(nram_buf + nram_qk_offset_cur,
+                             (int16*) nram_buf + nram_htsr_offset,
+                             wram_buf + WRAM_KERNEL_Q_BUF,
+                             nram_buf + NRAM_BIAS_BUF_Q, fix_pos0);
+          mlisa_half2int16_rd_PR0((int16*) nram_buf + nram_qk_offset_cur,
+                                  nram_buf + nram_qk_offset_cur,
+                                  SEQ_LEN * HEAD_SIZE / 2, fix_pos1);
+          // Produce keys
+          mlisa_attr_mlp_PR0(nram_buf + nram_qk_offset_cur + SEQ_LEN * HEAD_SIZE / 2,
+                             (int16*) nram_buf + nram_htsr_offset,
+                             wram_buf + WRAM_KERNEL_K_BUF,
+                             nram_buf + NRAM_BIAS_BUF_K, fix_pos4);
+          mlisa_half2int16_rd_PR0((int16*) nram_buf + nram_qk_offset_cur +
+                                  SEQ_LEN * HEAD_SIZE / 2,
+                                  nram_buf + nram_qk_offset_cur + SEQ_LEN * HEAD_SIZE / 2,
+                                  SEQ_LEN * HEAD_SIZE / 2, fix_pos5);
+          // Store query
+          mlisa_mem_store_NtoS_async_PR2(sram_buf + qkv_sram_offset,
+                                         nram_buf + nram_qk_offset_prev,
+                                         sizeof(int16) * SEQ_LEN * HEAD_SIZE / 2);
+          mlisa_mem_store_NtoS_async_PR3(sram_buf + qkv_sram_offset + SEQ_LEN * HEAD_SIZE / 2,
+                                         nram_buf + nram_qk_offset_prev,
+                                         sizeof(int16) * SEQ_LEN * HEAD_SIZE / 2);
+          // Store key
+          mlisa_reshape_key_NtoS_async_PR2(sram_buf + qkv_sram_offset +
+                                           SEQ_LEN * HEAD_SIZE,
+                                           nram_buf + nram_qk_offset_prev +
+                                           SEQ_LEN * HEAD_SIZE / 2);
+          mlisa_reshape_key_NtoS_async_PR3(sram_buf + qkv_sram_offset +
+                                           SEQ_LEN * HEAD_SIZE + HEAD_SIZE,
+                                           nram_buf + nram_qk_offset_prev +
+                                           SEQ_LEN * HEAD_SIZE / 2);
+          // Store value
+          mlisa_mem_store_NtoS_async_PR4(sram_buf + qkv_sram_offset + SEQ_LEN * HEAD_SIZE * 2,
+                                         nram_buf + nram_v_offset_prev,
+                                         sizeof(int16) * SEQ_LEN * HEAD_SIZE);
+          // Preload attention output kernel
+          mlisa_setpred_lti_PR5(step, 4);
+          mlisa_load_kernel_GtoW_async_PR5(attout_kernel_wram_ptr, attout_kernel_gdram_ptr,
+                                           HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+          // Preload intermediate kernel
+          int cond_pr6 = (step >= 4 && step < 8);
+          mlisa_setpred_eqi_PR6(cond_pr6, 1);
+          mlisa_load_kernel_GtoW_async_PR6(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                           3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          // Switch NRAM buffers for next iteration
+          nram_qk_offset_prev = nram_qk_offset_cur;
+          pre_batch = cur_batch;
+          if ((step & 1) == 0) {
+            nram_htsr_offset = NRAM_HTSR_BUF1;
+            nram_qk_offset_cur = NRAM_QK_BUF1;
+            qkv_sram_offset = SRAM_QKV_BUF + cur_batch * SEQ_LEN * HEAD_SIZE * 9 +
+                              SEQ_LEN * HEAD_SIZE * 3 * coreId;
+            nram_v_offset_cur += SEQ_LEN * HEAD_SIZE / 2;
+          } else {
+            nram_htsr_offset = NRAM_HTSR_BUF0;
+            nram_qk_offset_cur = NRAM_QK_BUF0;
+            int tmp = nram_v_offset_cur - SEQ_LEN * HEAD_SIZE / 2;
+            nram_v_offset_cur = nram_v_offset_prev;
+            nram_v_offset_prev = tmp;
+          }
+          if (step < 4) {
+            attout_kernel_wram_ptr += HEAD_SIZE * HIDDEN_DIM / 4 / 64;
+            attout_kernel_gdram_ptr += HEAD_SIZE * HIDDEN_DIM / 4;
+          } else if (step < 8) {
+            inter_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+            inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16;
+          }
+        }
+        mlisa_sync();
+        // Store query
+        __mlvm_memcpy_nram_to_sram_async(sram_buf + qkv_sram_offset + SEQ_LEN * HEAD_SIZE / 2,
+                                         nram_buf + nram_qk_offset_prev,
+                                         sizeof(int16) * SEQ_LEN * HEAD_SIZE / 2);
+        // Store key
+        mlisa_reshape_key_NtoS_async(sram_buf + qkv_sram_offset +
+                                     SEQ_LEN * HEAD_SIZE + HEAD_SIZE,
+                                     nram_buf + nram_qk_offset_prev + SEQ_LEN * HEAD_SIZE /2);
+        // Store value
+        __mlvm_memcpy_nram_to_sram_async(sram_buf + qkv_sram_offset + SEQ_LEN * HEAD_SIZE * 2,
+                                         nram_buf + nram_v_offset_prev,
+                                         sizeof(int16) * SEQ_LEN * HEAD_SIZE);
+      } else if (coreId == 3) {
+        // Broadcast tensors
+        for (int step = 0; step < num_iters; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          mlisa_barrier_all();
+          int cur_batch = ((clusterId + (((step + 1) >> 1) & 3)) & 3) + (((step + 1) >> 3) << 2);
+          if (step < num_iters - 1) {
+            // Broadcast tensor from SRAM to IPU0-IPU2 NRAM the mask is 0x7
+            if ((step & 1) == 0 && cur_batch <= batch_num) {
+              mlisa_attr_multicast_tensor(nram_buf + NRAM_HTSR_BUF1,
+                                          sram_buf + sram_exld_offset + HALF_TENSOR_SIZE,
+                                          sizeof(half) * HALF_TENSOR_SIZE);
+            } else if (cur_batch <= batch_num) {
+              mlisa_attr_multicast_tensor(nram_buf + NRAM_HTSR_BUF0,
+                                          sram_buf + sram_exld_offset,
+                                          sizeof(half) * HALF_TENSOR_SIZE);
+            }
+          }
+          // Switch SRAM buffers for next iteration
+          if (step != 6) {
+            if ((step & 1) == 0) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }
+          } else if (step == 6 && batch_num > 4) {
+            sram_exld_offset = SRAM_TSR_BUF1;
+            sram_recv_offset = SRAM_TSR_BUF2;
+          }
+          if (step >= 4 && step < 8) {
+            mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                         3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            inter_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+            inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16;
+          }
+        }
+      }
+    } // End of producing queries, keys and values
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    mlisa_barrier_cluster();
+
+    // Produce attention probs (batched QK matmul and SoftMax)
+    // Note that for 4 and 8 batches, we use 4 IPU cores. Otherwise, we use 3 IPU cores.
+    // As a result, the QKV fetching patterns are different for the two situations.
+    // Additionally, for 5~8 batches, we first process the first 4 batches, then process
+    // the left batches.
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Prepare data for the first iteration
+      int sram_qkv_offset;
+      if (batch_num >= 4) {
+        sram_qkv_offset = SRAM_QKV_BUF + SEQ_LEN * HEAD_SIZE * 9 * coreId;
+      } else {
+        sram_qkv_offset = SRAM_QKV_BUF + SEQ_LEN * HEAD_SIZE * 3 * coreId;
+      }
+
+      // Prepare attention mask
+      __mlvm_memcpy_wram_to_nram_async(nram_buf + NRAM_MASK_BUF, wram_buf + WRAM_MASK_BUF,
+                                       sizeof(half) * batch_num * SEQ_LEN);
+
+      if ((batch_num < 4 && coreId < 3) || (batch_num >= 4)) {
+        __mlvm_memcpy_sram_to_nram_async(nram_buf + NRAM_CTX_BUF0,
+                                         sram_buf + sram_qkv_offset,
+                                         sizeof(half) * SEQ_LEN * HEAD_SIZE);
+        __mlvm_memcpy_sram_to_wram_async(wram_buf + WRAM_K_BUF0,
+                                         sram_buf + sram_qkv_offset + SEQ_LEN * HEAD_SIZE,
+                                         sizeof(half) * SEQ_LEN * HEAD_SIZE);
+        __mlvm_memcpy_sram_to_wram_async(wram_buf + WRAM_V_BUF0,
+                                         sram_buf + sram_qkv_offset + 2 * SEQ_LEN * HEAD_SIZE,
+                                         sizeof(half) * SEQ_LEN * HEAD_SIZE);
+      }
+
+      int16* inter_kernel_wram_ptr = wram_buf + WRAM_KERNEL_INTER_BUF +
+                                     4 * 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+
+      // WRAM offsets set up
+      int wram_k_ld_offset  = WRAM_K_BUF1;
+      int wram_k_mlp_offset = WRAM_K_BUF0;
+      int wram_v_ld_offset  = WRAM_V_BUF1;
+      int wram_v_mlp_offset = WRAM_V_BUF0;
+
+      // QKV buffer offsets set up
+      // Note we use the same NRAM buffer for input and output
+      int nram_ctx_offset_cur = NRAM_CTX_BUF0;
+      int nram_ctx_offset_prev = NRAM_CTX_BUF1;
+      int sram_ctx_offset_cur = SRAM_CTX_BUF0 + coreId * SEQ_LEN * HEAD_SIZE;
+      int sram_ctx_offset_prev = SRAM_CTX_BUF1 + coreId * SEQ_LEN * HEAD_SIZE;
+      int sram_reshape_offset;
+      int num_iters;
+      int mask_offset;
+
+      if (batch_num >= 4) {
+        sram_qkv_offset += SEQ_LEN * HEAD_SIZE * 3;
+        sram_reshape_offset = SRAM_TSR_BUF0 + clusterId * 3 * HEAD_SIZE +
+                              TENSOR_SIZE / 4 * coreId;
+        mask_offset = coreId * SEQ_LEN;
+        if (batch_num < 8) {
+          num_iters = 3 + (batch_num - 4);
+        } else {
+          num_iters = 6;
+        }
+      } else {
+        sram_qkv_offset += SEQ_LEN * HEAD_SIZE * 9;
+        sram_reshape_offset = SRAM_TSR_BUF0 + clusterId * 3 * HEAD_SIZE + coreId * HEAD_SIZE;
+        mask_offset = 0;
+        num_iters = batch_num;
+      }
+      mlisa_sync();
+
+      if (coreId == MEM_CORE) {
+        // The memcore is responsible for reshaping tensors between clusters
+        // The batch on each core corresponds to the final cluster holds this batch.
+        sram_ctx_offset_cur = SRAM_CTX_BUF0;
+        sram_ctx_offset_prev = SRAM_CTX_BUF1;
+        sram_reshape_offset = SRAM_TSR_BUF0 + clusterId * 3 * HEAD_SIZE;
+        int reshape0, reshape1, reshape2;
+        switch (clusterId) {
+          case 0:
+            reshape0 = 1; reshape1 = 2; reshape2 = 3;
+            break;
+          case 1:
+            reshape0 = 0; reshape1 = 2; reshape2 = 3;
+            break;
+          case 2:
+            reshape0 = 0; reshape1 = 1; reshape2 = 3;
+            break;
+          case 3:
+            reshape0 = 0; reshape1 = 1; reshape2 = 2;
+            break;
+          default:
+            reshape0 = -1; reshape1 = -1; reshape2 = -1;
+            break;
+        }
+        // Iterations for reshaping tensors (memcore is two steps below IPU cores)
+        for (int step = 0; step < num_iters + 2; step ++) {
+          if (step >= 1) {
+            mlisa_barrier_cluster();
+          }
+          if (step > 1) {
+            if (batch_num < 4 || (batch_num != 8 && step > 4)) {
+              // Reshape the result of core #0 to other clusters
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset,
+                                            sram_buf + sram_ctx_offset_prev,
+                                            SEQ_LEN / 4 - 1, reshape0);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape1);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape2);
+              // Reshape the result of core #1 to other clusters
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE,
+                                            SEQ_LEN / 4 - 1, reshape0);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE + SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape1);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE + 2 * SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape2);
+              // Reshape the result of core #2 to other clusters
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + 2 * HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE,
+                                            SEQ_LEN / 4 - 1, reshape0);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + 2 * HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE + SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape1);
+              mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset + 2 * HEAD_SIZE,
+                                            sram_buf + sram_ctx_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE + 2 * SEQ_LEN * HEAD_SIZE/4,
+                                            SEQ_LEN / 4 - 1, reshape2);
+            } else if (batch_num == 8 || (batch_num >= 4 && step <= 4)) {
+              for (int cur_core = 0; cur_core < CORE_DIM; cur_core ++) {
+                mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset +
+                                              cur_core * TENSOR_SIZE / 4,
+                                              sram_buf + sram_ctx_offset_prev +
+                                              cur_core * SEQ_LEN * HEAD_SIZE,
+                                              SEQ_LEN / 4 - 1, reshape0);
+                mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset +
+                                              cur_core * TENSOR_SIZE / 4,
+                                              sram_buf + sram_ctx_offset_prev +
+                                              SEQ_LEN * HEAD_SIZE / 4 +
+                                              cur_core * SEQ_LEN * HEAD_SIZE,
+                                              SEQ_LEN / 4 - 1, reshape1);
+                mlisa_attr_reshape_StoS_async(sram_buf + sram_reshape_offset +
+                                              cur_core * TENSOR_SIZE / 4,
+                                              sram_buf + sram_ctx_offset_prev +
+                                              2 * SEQ_LEN * HEAD_SIZE / 4 +
+                                              cur_core * SEQ_LEN * HEAD_SIZE,
+                                              SEQ_LEN / 4 - 1, reshape2);
+              }
+            }
+          }
+          // Switch buffers
+          int tmp = sram_ctx_offset_cur;
+          sram_ctx_offset_cur = sram_ctx_offset_prev;
+          sram_ctx_offset_prev = tmp;
+          if(step >= 2) {
+            if (batch_num < 4 || (batch_num != 8 && step > 4)) {
+              sram_reshape_offset += TENSOR_SIZE / 4;
+            } else {
+              sram_reshape_offset += HEAD_SIZE;
+            }
+            if (batch_num > 4 && step == 4) {
+              sram_reshape_offset = SRAM_TSR_BUF1 + clusterId * 3 * HEAD_SIZE;
+            }
+          }
+        }
+      } else {
+        // The code of IPU cores
+        // Iterations for producing batch qk matmul (each cluster has 3 heads)
+        int reshape_section_offset = clusterId * SEQ_LEN / CLUSTER_DIM * HEAD_SIZE;
+        int last_section_size = (3 - clusterId) * SEQ_LEN / CLUSTER_DIM * HEAD_SIZE;
+        /*int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 6] - 3; // qk mlp
+        int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 7]; // softmax
+        int fix_pos2 = fix_pos1 - nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 3]; // qkv mlp
+        int fix_pos3 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 8]; // qkv out*/
+        int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 7] - 3; // qk mlp
+        int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 8]; // softmax
+        int fix_pos2 = fix_pos1 - nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 4]; // qkv mlp
+        int fix_pos3 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 9]; // qkv out
+        for (int step = 0; step < num_iters; step ++) {
+          if (step >= 1) {
+            mlisa_barrier_cluster();
+          }
+          bool cond_partial_cores_case0 = (batch_num < 4 && coreId < 3);
+          bool cond_partial_cores_case1 = (batch_num > 4 && batch_num < 8 &&
+                                           step > 2 && coreId < 3);
+          bool cond_partial_cores = (cond_partial_cores_case0 || cond_partial_cores_case1);
+          bool cond_full_cores = (batch_num >= 4 && step < 3) || (batch_num == 8);
+          if (cond_partial_cores || cond_full_cores) {
+            // Store or reshape context layer out onto SRAM (three sections)
+            // for batch_num != 4 and 8
+            // Local reshape condition
+            uint32_t cond_pr0 = (step >= 1);
+            // First store condition
+            uint32_t cond_pr1 = (cond_pr0 && (clusterId > 0));
+            // Second store condition
+            uint32_t cond_pr2 = (cond_pr0 && (clusterId < 3));
+            mlisa_setpred_eqi_PR0(cond_pr0, 1);
+            mlisa_setpred_eqi_PR1(cond_pr1, 1);
+            mlisa_setpred_eqi_PR2(cond_pr2, 1);
+            // Preload intermediate kernel
+            mlisa_setpred_lti_PR4(step, 3);
+            mlisa_load_kernel_GtoW_async_PR4(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                             3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            // Batched QK matmul
+            __bang_conv(nram_buf + NRAM_SMAX_BUF0,
+                        (int16*) nram_buf + nram_ctx_offset_cur,
+                        (int16*) wram_buf + wram_k_mlp_offset,
+                        64, 1, 128, 1, 1, 1, 1, 128, fix_pos0);
+            // Softmax
+            __bang_cycle_add(nram_buf + NRAM_SMAX_BUF1, nram_buf + NRAM_SMAX_BUF0,
+                             nram_buf + NRAM_MASK_BUF + mask_offset,
+                             SEQ_LEN * SEQ_LEN, SEQ_LEN);
+            __bang_transpose(nram_buf + NRAM_SMAX_BUF0,
+                             nram_buf + NRAM_SMAX_BUF1,
+                             SEQ_LEN, SEQ_LEN);
+            __bang_maxpool(nram_buf + NRAM_SMAX_REDUCE_BUF, nram_buf + NRAM_SMAX_BUF0,
+                           SEQ_LEN, SEQ_LEN, 1, SEQ_LEN, 1);
+            __bang_cycle_sub(nram_buf + NRAM_SMAX_BUF2, nram_buf + NRAM_SMAX_BUF0,
+                             nram_buf + NRAM_SMAX_REDUCE_BUF,
+                             SEQ_LEN * SEQ_LEN, SEQ_LEN);
+            __bang_active_exp_less_0(nram_buf + NRAM_SMAX_BUF2,
+                                     nram_buf + NRAM_SMAX_BUF2,
+                                     SEQ_LEN * SEQ_LEN);
+            mlisa_load_kernel_GtoW_async_PR4(inter_kernel_wram_ptr +
+                                             3 * HEAD_SIZE * HIDDEN_DIM/16/64,
+                                             inter_kernel_gdram_ptr +
+                                             3 * HEAD_SIZE * HIDDEN_DIM / 16,
+                                             3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            mlisa_attr_reshape_NtoS_async_PR0(sram_buf + sram_reshape_offset,
+                                              nram_buf + nram_ctx_offset_prev +
+                                              reshape_section_offset, SEQ_LEN / 4 - 1);
+            __bang_half2float((float*) (nram_buf + NRAM_SMAX_BUF0),
+                              nram_buf + NRAM_SMAX_BUF2, SEQ_LEN * SEQ_LEN);
+            __bang_sumpool((float*) (nram_buf + NRAM_SMAX_REDUCE_BUF),
+                           (float*) (nram_buf + NRAM_SMAX_BUF0),
+                           SEQ_LEN, SEQ_LEN, 1, SEQ_LEN, 1, 1, 1);
+            __bang_active_recip_greater_1((float*) (nram_buf + NRAM_SMAX_REDUCE_BUF),
+                                          (float*) (nram_buf + NRAM_SMAX_REDUCE_BUF), SEQ_LEN);
+            // Store the first section
+            mlisa_ctx_store_NtoS_async_PR1(sram_buf + sram_ctx_offset_cur,
+                                           nram_buf + nram_ctx_offset_prev,
+                                           sizeof(half) * reshape_section_offset);
+            // Store the second section
+            mlisa_ctx_store_NtoS_async_PR2(sram_buf + sram_ctx_offset_cur +
+                                           reshape_section_offset,
+                                           nram_buf + nram_ctx_offset_prev +
+                                           reshape_section_offset + SEQ_LEN * HEAD_SIZE / 4,
+                                           sizeof(half) * last_section_size);
+            __bang_float2half_rd(nram_buf + NRAM_SMAX_BUF2,
+                                 (float*) (nram_buf + NRAM_SMAX_BUF0),
+                                 SEQ_LEN * SEQ_LEN);
+            __bang_float2half_rd(nram_buf + NRAM_SMAX_BUF1,
+                                 (float*) (nram_buf + NRAM_SMAX_REDUCE_BUF),
+                                 SEQ_LEN);
+            __bang_cycle_mul(nram_buf + NRAM_SMAX_BUF2,
+                             nram_buf + NRAM_SMAX_BUF2,
+                             nram_buf + NRAM_SMAX_BUF1,
+                             SEQ_LEN * SEQ_LEN, SEQ_LEN);
+            __bang_transpose(nram_buf + NRAM_SMAX_BUF1, nram_buf + NRAM_SMAX_BUF2,
+                             SEQ_LEN, SEQ_LEN);
+            __bang_half2int16_rd((int16*) nram_buf + NRAM_SMAX_BUF0, nram_buf + NRAM_SMAX_BUF1,
+                                 SEQ_LEN * SEQ_LEN, fix_pos1);
+            __bang_conv(nram_buf + nram_ctx_offset_cur,
+                        (int16*) (nram_buf + NRAM_SMAX_BUF0),
+                        (int16*) (wram_buf + wram_v_mlp_offset),
+                        128, 1, 128, 1, 1, 1, 1, 64, fix_pos2);
+            __bang_half2int16_rd((int16*) (nram_buf + nram_ctx_offset_cur),
+                                 nram_buf + nram_ctx_offset_cur,
+                                 SEQ_LEN * HEAD_SIZE, fix_pos3);
+            // Data prefetch for the next iteration
+            mlisa_setpred_lt_PR3(step, num_iters - 1);
+            mlisa_mem_load_StoW_async_PR3(wram_buf + wram_k_ld_offset,
+                                          sram_buf + sram_qkv_offset + SEQ_LEN * HEAD_SIZE,
+                                          sizeof(half) * SEQ_LEN * HEAD_SIZE);
+            mlisa_mem_load_StoW_async_PR3(wram_buf + wram_v_ld_offset,
+                                          sram_buf + sram_qkv_offset + 2 * SEQ_LEN * HEAD_SIZE,
+                                          sizeof(half) * SEQ_LEN * HEAD_SIZE);
+            // We put LOAD at the tail of MEM ops, because nram_ctx_offset_prev is reused
+            mlisa_mem_load_StoN_async_PR3(nram_buf + nram_ctx_offset_prev,
+                                          sram_buf + sram_qkv_offset,
+                                          sizeof(half) * SEQ_LEN * HEAD_SIZE);
+            int tmp = wram_k_mlp_offset;
+            wram_k_mlp_offset = wram_k_ld_offset;
+            wram_k_ld_offset = tmp;
+            tmp = wram_v_mlp_offset;
+            wram_v_mlp_offset = wram_v_ld_offset;
+            wram_v_ld_offset = tmp;
+            tmp = sram_ctx_offset_cur;
+            sram_ctx_offset_cur = sram_ctx_offset_prev;
+            sram_ctx_offset_prev = tmp;
+            tmp = nram_ctx_offset_cur;
+            nram_ctx_offset_cur = nram_ctx_offset_prev;
+            nram_ctx_offset_prev = tmp;
+            if (cond_full_cores) {
+              sram_qkv_offset += SEQ_LEN * HEAD_SIZE * 3;
+              if (step == 2 && batch_num == 8) {
+                mask_offset = 4 * SEQ_LEN + coreId * SEQ_LEN;
+              }
+              if (step == 1 && batch_num == 8) {
+                sram_qkv_offset = SRAM_QKV_BUF + SEQ_LEN * HEAD_SIZE * 36 +
+                                  SEQ_LEN * HEAD_SIZE * 9 * coreId;
+              }
+            } else {
+              sram_qkv_offset += SEQ_LEN * HEAD_SIZE * 9;
+              mask_offset += SEQ_LEN;
+            }
+            if (step >= 1) {
+              if (cond_full_cores) {
+                sram_reshape_offset += HEAD_SIZE;
+                if (batch_num == 8 && step == 3) {
+                  sram_reshape_offset = SRAM_TSR_BUF1 + clusterId * 3 * HEAD_SIZE +
+                                        TENSOR_SIZE / 4 * coreId;
+                }
+              } else {
+                sram_reshape_offset += TENSOR_SIZE / 4;
+              }
+            }
+            if (step < 3) {
+              inter_kernel_wram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+              inter_kernel_gdram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16;
+            }
+          } else if (coreId == 3 && step < 3) {
+            // Preload intermediate kernel
+            mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                         3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr +
+                                         3 * HEAD_SIZE * HIDDEN_DIM/16/64,
+                                         inter_kernel_gdram_ptr +
+                                         3 * HEAD_SIZE * HIDDEN_DIM / 16,
+                                         3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            inter_kernel_wram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+            inter_kernel_gdram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16;
+          }
+          if (batch_num > 4 && batch_num < 8) {
+            if (step == 1) {
+              sram_qkv_offset = SRAM_QKV_BUF + SEQ_LEN * HEAD_SIZE * 36 +
+                                SEQ_LEN * HEAD_SIZE * 3 * coreId;
+            } else if (step == 2) {
+              sram_qkv_offset = SRAM_QKV_BUF + SEQ_LEN * HEAD_SIZE * 45 +
+                                SEQ_LEN * HEAD_SIZE * 3 * coreId;
+              mask_offset = 4 * SEQ_LEN;
+            } else if (step == 3) {
+              if (coreId == 3) {
+                mlisa_attr_reshape_NtoS_async(sram_buf + sram_reshape_offset,
+                                              nram_buf + nram_ctx_offset_prev +
+                                              reshape_section_offset, SEQ_LEN / 4 - 1);
+                mlisa_setpred_gti_PR1(clusterId, 0);
+                mlisa_setpred_lti_PR2(clusterId, 3);
+                // Store the first section
+                mlisa_ctx_store_NtoS_async_PR1(sram_buf + sram_ctx_offset_cur,
+                                               nram_buf + nram_ctx_offset_prev,
+                                               sizeof(half) * reshape_section_offset);
+                // Store the second section
+                mlisa_ctx_store_NtoS_async_PR2(sram_buf + sram_ctx_offset_cur +
+                                               reshape_section_offset,
+                                               nram_buf + nram_ctx_offset_prev +
+                                               reshape_section_offset + SEQ_LEN * HEAD_SIZE / 4,
+                                               sizeof(half) * last_section_size);
+              }
+              sram_reshape_offset = SRAM_TSR_BUF1 + clusterId * 3 * HEAD_SIZE + coreId * HEAD_SIZE;
+            }
+          }
+        } // End of For iterations
+        mlisa_barrier_cluster();
+        if (num_iters == 1) {
+          // Preload intermediate kernel
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM/16/64,
+                                       inter_kernel_gdram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM / 16,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          inter_kernel_wram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+          inter_kernel_gdram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16;
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM/16/64,
+                                       inter_kernel_gdram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM / 16,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          inter_kernel_wram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+          inter_kernel_gdram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16;
+        } else if (num_iters == 2) {
+          // Preload intermediate kernel
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM/16/64,
+                                       inter_kernel_gdram_ptr +
+                                       3 * HEAD_SIZE * HIDDEN_DIM / 16,
+                                       3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          inter_kernel_wram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+          inter_kernel_gdram_ptr += 2 * 3 * HEAD_SIZE * HIDDEN_DIM/16;
+        }
+        bool cond_full_cores = (batch_num == 4 || batch_num == 8);
+        if ((!cond_full_cores && coreId < 3) || cond_full_cores) {
+          mlisa_attr_reshape_NtoS_async(sram_buf + sram_reshape_offset,
+                                        nram_buf + nram_ctx_offset_prev +
+                                        reshape_section_offset, SEQ_LEN/4 - 1);
+          mlisa_setpred_gti_PR1(clusterId, 0);
+          mlisa_setpred_lti_PR2(clusterId, 3);
+          // Store the first section
+          mlisa_ctx_store_NtoS_async_PR1(sram_buf + sram_ctx_offset_cur,
+                                         nram_buf + nram_ctx_offset_prev,
+                                         sizeof(half) * reshape_section_offset);
+          // Store the second section
+          mlisa_ctx_store_NtoS_async_PR2(sram_buf + sram_ctx_offset_cur +
+                                         reshape_section_offset,
+                                         nram_buf + nram_ctx_offset_prev +
+                                         reshape_section_offset + SEQ_LEN * HEAD_SIZE / 4,
+                                         sizeof(half) * last_section_size);
+        }
+        mlisa_barrier_cluster();
+      }
+    } // End of producing attention probs (batched QK matmul and SoftMax)
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    mlisa_barrier_all();
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Prepare data for the first iteration of attention output kernel
+      // Load bias into NRAM
+      if (coreId < 3) {
+        int bias_offset = (clusterId * 3 + coreId) * HEAD_SIZE;
+        __memcpy(&nram_buf[NRAM_BIAS_BUF_ATTOUT], attr_output_bias + bias_offset,
+                 sizeof(half) * HEAD_SIZE, GDRAM2NRAM);
+      }
+      // Send the input tensor in the first buffer to the previous cluster
+      int num_iters = 4;
+      int task_tsr_size = TENSOR_SIZE / 4 * batch_num;
+      int task_size = SEQ_LEN / 4 * batch_num;
+      if (batch_num > 4) {
+        task_tsr_size = TENSOR_SIZE;
+        task_size = SEQ_LEN;
+        num_iters = 8;
+      }
+      int16* inter_kernel_wram_ptr = wram_buf + WRAM_KERNEL_INTER_BUF +
+                                     10 * 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+      __mlvm_memcpy_sram_to_sram(sram_buf + SRAM_TSR_BUF2, sram_buf + SRAM_TSR_BUF0,
+                                 sizeof(half) * task_tsr_size, dst_cluster_id);
+      // Broadcast tensor from SRAM to IPU0-IPU2 NRAM, the mask is 0x7
+      // Use predicate register
+      mlisa_setpred_eqi_PR0(coreId, 3);
+      mlisa_attr_multicast_tensor_PR0(nram_buf + NRAM_ATT_IN_BUF0, sram_buf + SRAM_TSR_BUF0,
+                                      sizeof(half) * task_tsr_size);
+      mlisa_sync();
+
+      int nram_tsr_offset_cur = NRAM_ATT_IN_BUF0;
+      int nram_tsr_offset_prev = NRAM_ATT_IN_BUF1;
+      int sram_recv_offset = SRAM_TSR_BUF0;
+      int sram_exld_offset = SRAM_TSR_BUF2; // offset of tensor prefetch and exchange
+      // Output kernel result NRAM buffer
+      int nram_attout_offset_cur = NRAM_ATT_OUT_BUF0;
+      int nram_attout_offset_prev = NRAM_ATT_OUT_BUF1;
+      // SRAM offsets for temporary store and reshape
+      int sram_remote_reshape_offset = clusterId * 3 * HEAD_SIZE;
+      int sram_attout_offset_cur = SRAM_ATT_OUT_BUF1;
+      int sram_attout_offset_prev = SRAM_ATT_OUT_BUF0;
+
+      if(coreId == MEM_CORE) {
+        // Exchange input tensor and reshape output tensor
+        for (int step = 0; step < num_iters + 2; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          if (step < num_iters) {
+            mlisa_barrier_all();
+          } else {
+            mlisa_barrier_cluster();
+          }
+          if (step < num_iters - 1 && step != 2) {
+            __mlvm_memcpy_sram_to_sram(sram_buf + sram_recv_offset,
+                                       sram_buf + sram_exld_offset,
+                                       sizeof(half) * task_tsr_size, dst_cluster_id);
+          }
+          int base = (((step - 2) >> 2) << 2);
+          int dst_cluster_id = ((clusterId + ((step - 2) & 3)) & 3);
+          int cur_batch = dst_cluster_id + base;
+          uint32_t cond_pr1 = (step > 2 && step != 6 && cur_batch < 4);
+          uint32_t cond_pr2 = (step > 2 && step != 6 && cur_batch >= 4);
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_setpred_eqi_PR2(cond_pr2, 1);
+          mlisa_attr_reshape_StoS_async_PR1(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF3,
+                                            sram_buf + sram_attout_offset_prev,
+                                            task_size - 1, dst_cluster_id);
+          mlisa_attr_reshape_StoS_async_PR1(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF3 + HEAD_SIZE,
+                                            sram_buf + sram_attout_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE,
+                                            task_size - 1, dst_cluster_id);
+          mlisa_attr_reshape_StoS_async_PR1(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF3 + 2 * HEAD_SIZE,
+                                            sram_buf + sram_attout_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE,
+                                            task_size - 1, dst_cluster_id);
+          mlisa_attr_reshape_StoS_async_PR2(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF4,
+                                            sram_buf + sram_attout_offset_prev,
+                                            task_size - 1, dst_cluster_id);
+          mlisa_attr_reshape_StoS_async_PR2(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF4 + HEAD_SIZE,
+                                            sram_buf + sram_attout_offset_prev +
+                                            SEQ_LEN * HEAD_SIZE,
+                                            task_size - 1, dst_cluster_id);
+          mlisa_attr_reshape_StoS_async_PR2(sram_buf + sram_remote_reshape_offset +
+                                            SRAM_TSR_BUF4 + 2 * HEAD_SIZE,
+                                            sram_buf + sram_attout_offset_prev +
+                                            2 * SEQ_LEN * HEAD_SIZE,
+                                            task_size - 1, dst_cluster_id);
+          int tmp = sram_attout_offset_cur;
+          sram_attout_offset_cur = sram_attout_offset_prev;
+          sram_attout_offset_prev = tmp;
+          // Switch SRAM buffers for next iteration
+          if (step != 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          } else {
+            sram_exld_offset = SRAM_TSR_BUF1;
+            sram_recv_offset = SRAM_TSR_BUF2;
+            task_tsr_size = TENSOR_SIZE / 4 * (batch_num - 4);
+          }
+          if (step == 5) {
+            task_size = SEQ_LEN / 4 * (batch_num - 4);
+          }
+        }
+      } else if(coreId < 3) {
+        // Produce attention output
+        int local_reshape_offset = (clusterId * 3 + coreId) * HEAD_SIZE;
+        int local_store_offset = coreId * SEQ_LEN * HEAD_SIZE;
+        //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 9]; // attention out mlp
+        int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 10]; // attention out mlp
+        for (int step = 0; step < num_iters; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          mlisa_barrier_all();
+          // Produce the attention output kernel out
+          __bang_conv(nram_buf + nram_attout_offset_cur,
+                      (int16*) (nram_buf + nram_tsr_offset_cur),
+                      (int16*) (wram_buf + WRAM_KERNEL_ATTOUT_BUF),
+                      nram_buf + NRAM_BIAS_BUF_ATTOUT,
+                      768, 1, task_size, 1, 1, 1, 1, 64, fix_pos0);
+          mlisa_setpred_eqi_PR0(step, 1);
+          mlisa_attr_reshape_NtoS_async_PR0(sram_buf + SRAM_TSR_BUF3 +
+                                            local_reshape_offset,
+                                            nram_buf + nram_attout_offset_prev, task_size - 1);
+          mlisa_setpred_eqi_PR1(step, 5);
+          mlisa_attr_reshape_NtoS_async_PR1(sram_buf + SRAM_TSR_BUF4 +
+                                            local_reshape_offset,
+                                            nram_buf + nram_attout_offset_prev, task_size - 1);
+          uint32_t cond_pr2 = ((step > 1) && (step != 5));
+          mlisa_setpred_eqi_PR2(cond_pr2, 1);
+          mlisa_mem_store_NtoS_async_PR2(sram_buf + sram_attout_offset_cur +
+                                         local_store_offset,
+                                         nram_buf + nram_attout_offset_prev,
+                                         sizeof(int16) * task_size * HEAD_SIZE);
+          // Preload intermediate kernel
+          mlisa_setpred_lti_PR3(step, 6);
+          mlisa_load_kernel_GtoW_async_PR3(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                           3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+          int tmp = nram_tsr_offset_cur;
+          nram_tsr_offset_cur = nram_tsr_offset_prev;
+          nram_tsr_offset_prev = tmp;
+          tmp = nram_attout_offset_cur;
+          nram_attout_offset_cur = nram_attout_offset_prev;
+          nram_attout_offset_prev = tmp;
+          tmp = sram_attout_offset_cur;
+          sram_attout_offset_cur = sram_attout_offset_prev;
+          sram_attout_offset_prev = tmp;
+          if (step == 4 && batch_num > 4) {
+            task_size = SEQ_LEN / 4 * (batch_num - 4);
+          }
+          if (step < 6) {
+            inter_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+            inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16;
+          }
+        }
+        mlisa_barrier_cluster();
+        __mlvm_memcpy_nram_to_sram_async(sram_buf + sram_attout_offset_cur +
+                                         local_store_offset,
+                                         nram_buf + nram_attout_offset_prev,
+                                         sizeof(int16) * task_size * HEAD_SIZE);
+        mlisa_barrier_cluster();
+        // Move input tensor into NRAM from WRAM for layer normalization
+        __mlvm_memcpy_wram_to_nram_async(nram_buf + NRAM_LN_PRE_TSR_BUF,
+                                         wram_buf + WRAM_TENSOR_BUF,
+                                         sizeof(half) * batch_num * TENSOR_SIZE / TOTAL_CORES);
+      } else if(coreId == 3) {
+        // Broadcast tensors
+        for (int step = 0; step < num_iters; step ++) {
+          // Syncronize all cores, clusters, mem and computations
+          mlisa_barrier_all();
+          uint32_t cond_pr0 = ((step < num_iters - 1) && ((step & 1) == 0));
+          uint32_t cond_pr1 = ((step < num_iters - 1) && ((step & 1) == 1));
+          mlisa_setpred_eqi_PR0(cond_pr0, 1);
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_attr_multicast_tensor_PR0(nram_buf + NRAM_ATT_IN_BUF1,
+                                          sram_buf + sram_exld_offset,
+                                          sizeof(half) * task_tsr_size);
+          mlisa_attr_multicast_tensor_PR1(nram_buf + NRAM_ATT_IN_BUF0,
+                                          sram_buf + sram_exld_offset,
+                                          sizeof(half) * task_tsr_size);
+          if (step < 6) {
+            mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                         3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+            inter_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+            inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 16;
+          }
+          // Switch SRAM buffers for next iteration
+          if(step != 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          }else {
+            sram_exld_offset = SRAM_TSR_BUF1;
+            sram_recv_offset = SRAM_TSR_BUF2;
+            task_tsr_size = TENSOR_SIZE / 4 * (batch_num - 4);
+          }
+
+        }
+        // Move input tensor into NRAM from WRAM for layer normalization
+        __mlvm_memcpy_wram_to_nram_async(nram_buf + NRAM_LN_PRE_TSR_BUF,
+                                         wram_buf + WRAM_TENSOR_BUF,
+                                         sizeof(half) * batch_num * TENSOR_SIZE / TOTAL_CORES);
+        mlisa_barrier_cluster();
+        mlisa_barrier_cluster();
+      }
+      if (num_iters == 4) {
+        mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                     3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+        inter_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM/16/64;
+        inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM/16;
+      }
+    } // End of producing attention output kernel out
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    mlisa_barrier_all();
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Layer normalization of the attention layer
+      int nram_dst_offset = NRAM_LN_CUR_TSR_BUF;
+      int sram_src_offset = SRAM_TSR_BUF3 + coreId * TENSOR_SIZE / TOTAL_CORES;
+      for (int i = 0; i < batch_num; i ++) {
+        __mlvm_memcpy_sram_to_nram_async(nram_buf + nram_dst_offset,
+                                         sram_buf + sram_src_offset,
+                                         sizeof(half) * TENSOR_SIZE / TOTAL_CORES);
+        nram_dst_offset += TENSOR_SIZE / TOTAL_CORES;
+        sram_src_offset += TENSOR_SIZE / CLUSTER_DIM;
+      }
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_LN_BETA_BUF,
+                                        attr_layernorm_beta,
+                                        sizeof(half) * HIDDEN_DIM);
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_LN_GAMMA_BUF,
+                                        attr_layernorm_gamma,
+                                        sizeof(half) * HIDDEN_DIM);
+      int task_size = TENSOR_SIZE / TOTAL_CORES * batch_num;
+      int channel_size = SEQ_LEN / 4;
+      int cycle_size = TENSOR_SIZE / 4;
+      if (batch_num > 4) {
+        channel_size = SEQ_LEN / 2;
+        cycle_size = TENSOR_SIZE / 2;
+      }
+      mlisa_sync();
+      if (batch_num <= 4) {
+        int16* inter_kernel_wram_ptr = wram_buf + WRAM_KERNEL_INTER_BUF +
+                                     15 * 3 * HEAD_SIZE * HIDDEN_DIM / 16 / 64;
+        mlisa_load_kernel_GtoW_async(inter_kernel_wram_ptr, inter_kernel_gdram_ptr,
+                                     3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/16);
+        inter_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM/16;
+      }
+      __bang_add(nram_buf + NRAM_LN_FP32_BUF,
+                 nram_buf + NRAM_LN_CUR_TSR_BUF,
+                 nram_buf + NRAM_LN_PRE_TSR_BUF,
+                 task_size);
+      mlisa_load_kernel_GtoW_async(wram_buf + WRAM_KERNEL_FFDOUT_BUF,
+                                   output_kernel_gdram_ptr,
+                                   3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __bang_half2float((float*)(nram_buf + NRAM_LN_PRE_TSR_BUF),
+                        nram_buf + NRAM_LN_FP32_BUF, task_size);
+      __bang_transpose((float*) (nram_buf + NRAM_LN_FP32_BUF),
+                       (float*) (nram_buf + NRAM_LN_PRE_TSR_BUF), channel_size, HIDDEN_DIM);
+      mlisa_load_kernel_GtoW_async(wram_buf + WRAM_KERNEL_FFDOUT_BUF +
+                                   3 * HEAD_SIZE * HIDDEN_DIM/8/64,
+                                   output_kernel_gdram_ptr + 3 * HEAD_SIZE * HIDDEN_DIM/8,
+                                   3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __bang_avgpool((float*)(nram_buf + NRAM_LN_MEAN_BUF),
+                     (float*)(nram_buf + NRAM_LN_FP32_BUF),
+                     channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+      __bang_cycle_sub((float*)(nram_buf + NRAM_LN_FP32_BUF),
+                       (float*)(nram_buf + NRAM_LN_FP32_BUF), (float*)(nram_buf + NRAM_LN_MEAN_BUF),
+                       cycle_size, channel_size);
+      mlisa_load_kernel_GtoW_async(wram_buf + WRAM_KERNEL_FFDOUT_BUF +
+                                   3 * HEAD_SIZE * HIDDEN_DIM/4/64,
+                                   output_kernel_gdram_ptr + 3 * HEAD_SIZE * HIDDEN_DIM/4,
+                                   3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __bang_square((float*)(nram_buf + NRAM_LN_FP32_VAR_BUF),
+                    (float*)(nram_buf + NRAM_LN_FP32_BUF), TENSOR_SIZE / 2);
+      __bang_avgpool((float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                     (float*)(nram_buf + NRAM_LN_FP32_VAR_BUF),
+                     channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+      __bang_active_rsqrt((float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                          (float*)(nram_buf + NRAM_LN_SVAR_BUF), channel_size);
+      __bang_cycle_mul((float*)(nram_buf + NRAM_LN_FP32_BUF),
+                       (float*)(nram_buf + NRAM_LN_FP32_BUF), (float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                       cycle_size, channel_size);
+      __bang_transpose((float*) (nram_buf + NRAM_LN_PRE_TSR_BUF),
+                       (float*) (nram_buf + NRAM_LN_FP32_BUF), HIDDEN_DIM, channel_size);
+      __bang_float2half_rd(nram_buf + NRAM_LN_FP32_BUF,
+                           (float*)(nram_buf + NRAM_LN_PRE_TSR_BUF), task_size);
+      __bang_cycle_mul(nram_buf + NRAM_LN_CUR_TSR_BUF,
+                       nram_buf + NRAM_LN_FP32_BUF, nram_buf + NRAM_LN_GAMMA_BUF,
+                       task_size, HIDDEN_DIM);
+      mlisa_load_kernel_GtoW_async(wram_buf + WRAM_KERNEL_FFDOUT_BUF +
+                                   3 * HEAD_SIZE * HIDDEN_DIM/8/64 * 3,
+                                   output_kernel_gdram_ptr + 3 * HEAD_SIZE * HIDDEN_DIM/8 * 3,
+                                   3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+      __bang_cycle_add(nram_buf + NRAM_LN_CUR_TSR_BUF,
+                       nram_buf + NRAM_LN_CUR_TSR_BUF, nram_buf + NRAM_LN_BETA_BUF,
+                       task_size, HIDDEN_DIM);
+      mlisa_sync();
+      __mlvm_memcpy_nram_to_wram_async(wram_buf + WRAM_TENSOR_BUF, nram_buf + NRAM_LN_CUR_TSR_BUF,
+                                       sizeof(half) * task_size);
+      //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 10]; // attention layernorm out
+      int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 11]; // attention layernorm out
+      mlisa_sync();
+      __bang_half2int16_rd((int16*) (nram_buf + NRAM_LN_CUR_TSR_BUF),
+                           nram_buf + NRAM_LN_CUR_TSR_BUF,
+                           task_size, fix_pos0);
+      mlisa_sync();
+      int nram_src_offset = NRAM_LN_CUR_TSR_BUF;
+      int sram_dst_offset = SRAM_TSR_BUF3 + coreId * TENSOR_SIZE / TOTAL_CORES;
+      for (int i = 0; i < batch_num; i ++) {
+        __mlvm_memcpy_nram_to_sram_async(sram_buf + sram_dst_offset,
+                                         nram_buf + nram_src_offset,
+                                         sizeof(half) * TENSOR_SIZE / TOTAL_CORES);
+        nram_src_offset += TENSOR_SIZE / TOTAL_CORES;
+        sram_dst_offset += TENSOR_SIZE / CLUSTER_DIM;
+      }
+    }
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    int bundle_size = (batch_num <= 4) ? batch_num : 4;
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Prepare data
+      // Load biases into NRAM
+      int bias_offset = (clusterId * 4 + coreId) * HEAD_SIZE * 3;
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_BIAS_BUF_INTER, inter_bias + bias_offset,
+                                        sizeof(half) * HEAD_SIZE * 3);
+      bias_offset = clusterId * HEAD_SIZE * 3;
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_BIAS_BUF_FFDOUT, output_bias + bias_offset,
+                                        sizeof(half) * HEAD_SIZE * 3);
+      mlisa_barrier_all();
+
+      // Send the input tensor in the first buffer to the previous cluster
+      __memcpy(sram_buf + SRAM_TSR_BUF0, sram_buf + SRAM_TSR_BUF3,
+               sizeof(half) * TENSOR_SIZE * bundle_size/4, SRAM2SRAM, dst_cluster_id);
+
+      // Broadcast tensor from SRAM to IPU0-IPU3 NRAM, the mask is 0xF
+      if(coreId == 0) {
+        mlisa_mem_multicast_StoN_all(nram_buf + NRAM_INTER_MLP_BUF0, sram_buf + SRAM_TSR_BUF3,
+                                     sizeof(half) * TENSOR_SIZE * bundle_size/4);
+      }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Produce intermediate output
+      // We reuse the input buffer as the output buffer.
+      // Because of this, the order of buffer load and store must be
+      // carefully handled.
+      int nram_inter_cur  = NRAM_INTER_MLP_BUF0;
+      int nram_inter_prev = NRAM_INTER_MLP_BUF1;
+      int sram_recv_offset = SRAM_TSR_BUF3;
+      int sram_exld_offset = SRAM_TSR_BUF0; // offset of tensor prefetch and exchange
+      int sram_copy_src_cur  = SRAM_INTER_OUT_BUFA0;
+      int sram_copy_src_prev = SRAM_INTER_OUT_BUFA1;
+
+      if(coreId == MEM_CORE) {
+        // Iterations for producing intermediate output (first four batches)
+        // The number of iterations (FFD_ITER_NUM) is determined by clusterDim
+        for (int step = 0; step < FFD_ITER_NUM + 1; step ++) {
+          mlisa_barrier_all();
+          // Exchange input tensor
+          mlisa_setpred_lti_PR0(step, 2);
+          mlisa_tensor_exchange_StoS_async_PR0(sram_buf + sram_recv_offset,
+                                               sram_buf + sram_exld_offset,
+                                               TENSOR_SIZE*bundle_size/4*sizeof(half),
+                                               dst_cluster_id);
+          int dst_copy_offset = SRAM_INTER_TSR_BUFA + clusterId*TENSOR_SIZE/2*bundle_size/4;
+          int dst_copy_id = ((step - 2 + clusterId) & 3);
+          mlisa_setpred_gei_PR1(step, 3);
+          mlisa_tensor_exchange_StoS_async_PR1(sram_buf + dst_copy_offset,
+                                               sram_buf + sram_copy_src_prev,
+                                               TENSOR_SIZE/2*bundle_size/4*sizeof(half),
+                                               dst_copy_id);
+          mlisa_tensor_exchange_StoS_async_PR1(sram_buf + dst_copy_offset + TENSOR_SIZE * 2,
+                                               sram_buf + sram_copy_src_prev + TENSOR_SIZE / 2,
+                                               TENSOR_SIZE/2*bundle_size/4*sizeof(half),
+                                               dst_copy_id);
+          // Switch NRAM and SRAM buffers for the next iteration
+          if(step < 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          }
+          int tmp = sram_copy_src_cur;
+          sram_copy_src_cur = sram_copy_src_prev;
+          sram_copy_src_prev = tmp;
+        }
+      } else {
+        int sram_reshape_offset = clusterId*TENSOR_SIZE/2*bundle_size/4 + SRAM_INTER_TSR_BUFA +
+                                  coreId * (HIDDEN_DIM / 4);
+        int16* output_kernel_wram_ptr = wram_buf + WRAM_KERNEL_FFDOUT_BUF +
+                                        3 * HEAD_SIZE * HIDDEN_DIM/2/64;
+        output_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM/2;
+        int16* query_kernel_wram_ptr = wram_buf + WRAM_KERNEL_Q_BUF;
+        query_kernel_gdram_ptr += 2 * HEAD_SIZE * HIDDEN_DIM;
+        //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 11]; // inter mlp
+        //int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 12]; // inter out
+        int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 12]; // inter mlp
+        int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 13]; // inter out
+        // Iterations for producing intermediate output (first four batches)
+        // The number of iterations (FFD_ITER_NUM) is determined by clusterDim
+        for (int step = 0; step < FFD_ITER_NUM + 1; step ++) {
+          mlisa_barrier_all();
+          // Producing intermediate output
+          mlisa_setpred_lti_PR3(step, FFD_ITER_NUM);
+          mlisa_inter_mlp_PR3((half*)(nram_buf + NRAM_INTER_OUT_BUF),
+                              (int16*)(nram_buf + nram_inter_cur),
+                              wram_buf + WRAM_KERNEL_INTER_BUF,
+                              nram_buf + NRAM_BIAS_BUF_INTER,
+                              SEQ_LEN/2*bundle_size/4, fix_pos0);
+          mlisa_load_kernel_GtoW_async_PR3(output_kernel_wram_ptr, output_kernel_gdram_ptr,
+                                           3 * HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+          // Reshape results to SRAM, batch_front * (32 * 192) -> batch_front * (32 * 768)
+          mlisa_setpred_eqi_PR1(step, 1);
+          mlisa_inter_reshape_NtoS_async_PR1(sram_buf + sram_reshape_offset,
+                                             nram_buf + nram_inter_prev,
+                                             SEQ_LEN/2*bundle_size/4 - 1);
+          mlisa_setpred_gti_PR2(step, 1);
+          mlisa_inter_reshape_NtoS_async_PR2(sram_buf + sram_reshape_offset,
+                                             nram_buf + nram_inter_prev,
+                                             SEQ_LEN/2*bundle_size/4 - 1);
+          mlisa_half2float_PR3((float*) (nram_buf + nram_inter_cur +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                nram_buf + NRAM_INTER_OUT_BUF,
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_inter_reshape_NtoS_async_PR1(sram_buf + sram_reshape_offset +
+                                             TENSOR_SIZE*2,
+                                             nram_buf + nram_inter_prev +
+                                             TENSOR_SIZE/2*bundle_size/4,
+                                             SEQ_LEN/2*bundle_size/4 - 1);
+          mlisa_inter_reshape_NtoS_async_PR2(sram_buf + sram_reshape_offset + TENSOR_SIZE/2,
+                                             nram_buf + nram_inter_prev +
+                                             TENSOR_SIZE/2*bundle_size/4,
+                                             SEQ_LEN/2*bundle_size/4 - 1);
+          mlisa_active_gelu_PR3((float*) (nram_buf + nram_inter_cur +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                (float*) (nram_buf + nram_inter_cur +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_float2half_rd_PR3(nram_buf + nram_inter_cur,
+                                  (float*) (nram_buf + nram_inter_cur +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_half2int16_rd_PR3((int16*)(nram_buf + nram_inter_cur),
+                                  nram_buf + nram_inter_cur,
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2, fix_pos1);
+          // Prefetch query kernel
+          uint32_t cond_pr4 = ((step < FFD_ITER_NUM) && (coreId < 3) &&
+                               (cur_layer < CHECK_LAYER));
+          mlisa_setpred_eqi_PR4(cond_pr4, 1);
+          mlisa_load_kernel_GtoW_async_PR4(query_kernel_wram_ptr, query_kernel_gdram_ptr,
+                                           HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+          // Load input tensor into NRAM, this must be placed after store
+          //uint32_t cond_pr0 = ((step < 3) && (coreId == 0));
+          mlisa_setpred_lti_PR0(step, FFD_ITER_NUM - 1);
+          mlisa_mem_load_StoN_async_PR0(nram_buf + nram_inter_prev,
+                                        sram_buf + sram_exld_offset,
+                                        TENSOR_SIZE*bundle_size/4*sizeof(half));
+          mlisa_inter_mlp_PR3((half*)(nram_buf + NRAM_INTER_OUT_BUF),
+                              (int16*)(nram_buf + nram_inter_cur +
+                              TENSOR_SIZE/2*bundle_size/4),
+                              wram_buf + WRAM_KERNEL_INTER_BUF,
+                              nram_buf + NRAM_BIAS_BUF_INTER,
+                              SEQ_LEN/2*bundle_size/4, fix_pos0);
+          mlisa_half2float_PR3 ((float*) (nram_buf + nram_inter_cur +
+                                TENSOR_SIZE/2*bundle_size/4 +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                nram_buf + NRAM_INTER_OUT_BUF,
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_active_gelu_PR3((float*) (nram_buf + nram_inter_cur +
+                                TENSOR_SIZE/2*bundle_size/4 +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                (float*) (nram_buf + nram_inter_cur +
+                                TENSOR_SIZE/2*bundle_size/4 +
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_float2half_rd_PR3(nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4,
+                                  (float*) (nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4 +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+          mlisa_half2int16_rd_PR3((int16*)(nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4),
+                                  nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4,
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2, fix_pos1);
+          // Switch NRAM and SRAM buffers for the next iteration
+          int tmp = nram_inter_cur;
+          nram_inter_cur = nram_inter_prev;
+          nram_inter_prev = tmp;
+          if(step < 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          }
+          tmp = sram_copy_src_cur;
+          sram_copy_src_cur = sram_copy_src_prev;
+          sram_copy_src_prev = tmp;
+          if(step >= 1) {
+            sram_reshape_offset = sram_copy_src_cur + coreId * (HIDDEN_DIM/4);
+          }
+          output_kernel_wram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 8 / 64;
+          query_kernel_wram_ptr += HEAD_SIZE * HIDDEN_DIM / 4 / 64;
+          if(step < FFD_ITER_NUM) {
+            output_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM / 8;
+            query_kernel_gdram_ptr += HEAD_SIZE * HIDDEN_DIM/4;
+          }
+        }
+      }
+      mlisa_barrier_cluster();
+      int dst_copy_offset = SRAM_INTER_TSR_BUFA +
+                            clusterId*TENSOR_SIZE/2*bundle_size/4;
+      int dst_copy_id = ((3 + clusterId) & 3);
+      __memcpy(sram_buf + dst_copy_offset, sram_buf + sram_copy_src_prev,
+               TENSOR_SIZE/2*bundle_size/4*sizeof(half), SRAM2SRAM, dst_copy_id);
+      dst_copy_offset = SRAM_INTER_TSR_BUFA + TENSOR_SIZE*2 +
+                        clusterId*TENSOR_SIZE/2*bundle_size/4;
+      __memcpy(sram_buf + dst_copy_offset, sram_buf + sram_copy_src_prev + TENSOR_SIZE/2,
+               TENSOR_SIZE/2*bundle_size/4*sizeof(half), SRAM2SRAM, dst_copy_id);
+    } // End of intermediate output
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    mlisa_barrier_all();
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    {// Send the input tensor in the first buffer to the previous cluster
+      __memcpy(sram_buf + SRAM_HINTER_TSR_BUFA2,
+               sram_buf + SRAM_HINTER_TSR_BUFA0,
+               sizeof(half)*TENSOR_SIZE*2*bundle_size/4,
+               SRAM2SRAM, dst_cluster_id);
+      // Load tensor from SRAM into NRAM
+      int tensor_load_offset = SRAM_HINTER_TSR_BUFA0 +
+                               coreId*TENSOR_SIZE/2*bundle_size/4;
+      __mlvm_memcpy_sram_to_nram_async(nram_buf + NRAM_FFDIN_BUF0, sram_buf + tensor_load_offset,
+                                       sizeof(half)*TENSOR_SIZE/2*bundle_size/4);
+      // Produce feedforward output
+      int nram_ffd_mlp_in_cur  = NRAM_FFDIN_BUF0;
+      int nram_ffd_mlp_in_prev = NRAM_FFDIN_BUF1;
+      int sram_recv_offset = SRAM_HINTER_TSR_BUFA0;
+      int sram_exld_offset = SRAM_HINTER_TSR_BUFA2; // offset of tensor prefetch and exchange
+      int sram_hffdout_cur  = SRAM_HFFD_OUT_BUFA0;
+      int sram_hffdout_prev = SRAM_HFFD_OUT_BUFA1;
+      int sram_hffdsum_cur  = SRAM_HFFD_SUM_BUFA0;
+      int sram_hffdsum_prev = SRAM_HFFD_SUM_BUFA1;
+      // Partial feedforward out result NRAM buffer
+      int nram_ffd_mlp_out_cur  = NRAM_FFDOUT_BUF0;
+      int nram_ffd_mlp_out_prev = NRAM_FFDOUT_BUF1;
+      // Feedforward partial results reduction NRAM buffer
+      int nram_ffdsum_in_cur  = NRAM_FFDSUM_IN_BUF0;
+      int nram_ffdsum_in_prev = NRAM_FFDSUM_IN_BUF1;
+      int nram_ffdsum_out_cur  = NRAM_FFDSUM_OUT_BUF0;
+      int nram_ffdsum_out_prev = NRAM_FFDSUM_OUT_BUF1;
+      if(coreId == MEM_CORE){
+        int sram_remote_buf = SRAM_TSR_BUF0 + clusterId * HEAD_SIZE * 3;
+        // Iterations for producing feedforward output (first four batches)
+        for (int step = 0; step <= FFD_ITER_NUM * 2 + 3; step ++) {
+          mlisa_barrier_all();
+          uint32_t cond_pr0 = ((step < FFD_ITER_NUM * 2 - 2) && (step != 2));
+          mlisa_setpred_eqi_PR0(cond_pr0, 1);
+          mlisa_tensor_exchange_StoS_async_PR0(sram_buf + sram_recv_offset,
+                                               sram_buf + sram_exld_offset,
+                                               sizeof(half)*TENSOR_SIZE*2*bundle_size/4,
+                                               dst_cluster_id);
+          int dst_cluster_id = ((clusterId + ((step - 5) & 3)) & 3);
+          uint32_t cond_pr1 = ((step >= 6) && (step != 9));
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_ffd_reshape_StoS_async_PR1(sram_buf + sram_remote_buf,
+                                           sram_buf + sram_hffdsum_prev,
+                                           SEQ_LEN/2*bundle_size/4 - 1,
+                                           dst_cluster_id);
+          // Switch NRAM and SRAM buffers for the next iteration
+          if(step != 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          }else {
+            sram_exld_offset = SRAM_HINTER_TSR_BUFA1;
+            sram_recv_offset = SRAM_HINTER_TSR_BUFA2;
+          }
+          if(step == 9) {
+            sram_remote_buf += TENSOR_SIZE/2*bundle_size/4;
+          }
+          int tmp = sram_hffdsum_cur;
+          sram_hffdsum_cur = sram_hffdsum_prev;
+          sram_hffdsum_prev = tmp;
+        }
+      }else {
+        //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 13]; // out mlp
+        int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 14]; // out mlp
+        // Iterations for producing feedforward output (first four batches)
+        __bang_half2float((float*) (nram_buf + NRAM_FFD_BIAS_F32_BUF),
+                          nram_buf + NRAM_BIAS_BUF_FFDOUT, HEAD_SIZE * 3);
+        int16* key_kernel_wram_ptr = wram_buf + WRAM_KERNEL_K_BUF;
+        key_kernel_gdram_ptr += 2 * HEAD_SIZE * HIDDEN_DIM;
+        for (int step = 0; step <= FFD_ITER_NUM * 2 + 3; step ++) {
+          mlisa_barrier_all();
+          // Data prefetch, inter-cluster exchange and async result save
+          mlisa_setpred_lti_PR0(step, FFD_ITER_NUM * 2 - 1);
+          mlisa_mem_load_StoN_async_PR0(nram_buf + nram_ffd_mlp_in_prev,
+                                        sram_buf + sram_exld_offset +
+                                        coreId*TENSOR_SIZE/2*bundle_size/4,
+                                        sizeof(half)*TENSOR_SIZE/2*bundle_size/4);
+          // Producing partial feedforward output
+          mlisa_setpred_lti_PR7(step, FFD_ITER_NUM * 2);
+          mlisa_feedforward_mlp_PR7((half*) (nram_buf + nram_ffd_mlp_out_cur),
+                                    (int16*) nram_buf + nram_ffd_mlp_in_cur,
+                                    wram_buf + WRAM_KERNEL_FFDOUT_BUF,
+                                    SEQ_LEN/2*bundle_size/4, fix_pos0);
+          // Prefetch key kernel
+          uint32_t cond_pr8 = ((step < FFD_ITER_NUM * 2) && (coreId < 3) &&
+                               (cur_layer < CHECK_LAYER));
+          mlisa_setpred_eqi_PR8(cond_pr8, 1);
+          mlisa_load_kernel_GtoW_async_PR8(key_kernel_wram_ptr, key_kernel_gdram_ptr,
+                                           HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/8);
+          // Reduce partial feedforward output
+          uint32_t cond_pr1 = ((step >= 2) && (step <= FFD_ITER_NUM * 2 + 1));
+          mlisa_setpred_eqi_PR1(cond_pr1, 1);
+          mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev,
+                                        sram_buf + sram_hffdout_prev +
+                                        coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                        sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                        SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                        sram_buf + sram_hffdout_prev +
+                                        SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4 +
+                                        coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                        sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                        SEQ_LEN*HEAD_SIZE*3/4*bundle_size/4,
+                                        sram_buf + sram_hffdout_prev +
+                                        SEQ_LEN*HEAD_SIZE*3*bundle_size/4 +
+                                        coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                        sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                        SEQ_LEN*HEAD_SIZE*3/8*3*bundle_size/4,
+                                        sram_buf + sram_hffdout_prev +
+                                        SEQ_LEN*HEAD_SIZE*3/2*3*bundle_size/4 +
+                                        coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                        sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          uint32_t cond_pr3 = ((step >= 3) && (step <= FFD_ITER_NUM * 2 + 2));
+          mlisa_setpred_eqi_PR3(cond_pr3, 1);
+          mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                               nram_buf + nram_ffdsum_in_cur,
+                               SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                               nram_buf + nram_ffdsum_in_cur +
+                               SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                               SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                   SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                               nram_buf + nram_ffdsum_in_cur +
+                               SEQ_LEN*HEAD_SIZE*3/4*bundle_size/4,
+                               SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                   SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                               nram_buf + nram_ffdsum_in_cur +
+                               SEQ_LEN*HEAD_SIZE*3/8*3*bundle_size/4,
+                               SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                   (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                   SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          mlisa_stream_cycle_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                         (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                         (float*) (nram_buf + NRAM_FFD_BIAS_F32_BUF),
+                                         SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4, HEAD_SIZE * 3);
+          mlisa_float2half_rd_PR3(nram_buf + nram_ffdsum_out_cur,
+                                  (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                  SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          uint32_t cond_pr2 = ((step >= 1) && (step <= FFD_ITER_NUM * 2));
+          mlisa_setpred_eqi_PR2(cond_pr2, 1);
+          mlisa_mem_store_NtoS_async_PR2(sram_buf + sram_hffdout_cur +
+                                         coreId*SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4,
+                                         nram_buf + nram_ffd_mlp_out_prev,
+                                         sizeof(half)*SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4);
+          mlisa_setpred_eqi_PR4(step, 4);
+          mlisa_ffd_reshape_NtoS_async_PR4(sram_buf + SRAM_TSR_BUF0 +
+                                           clusterId * HEAD_SIZE * 3 +
+                                           coreId*TENSOR_SIZE/8*bundle_size/4,
+                                           nram_buf + nram_ffdsum_out_prev,
+                                           SEQ_LEN/8*bundle_size/4 - 1);
+          mlisa_setpred_eqi_PR5(step, 8);
+          mlisa_ffd_reshape_NtoS_async_PR5(sram_buf + SRAM_TSR_BUF0 +
+                                           clusterId * HEAD_SIZE * 3 +
+                                           (coreId*TENSOR_SIZE/8+TENSOR_SIZE/2)*
+                                           bundle_size/4,
+                                           nram_buf + nram_ffdsum_out_prev,
+                                           SEQ_LEN/8*bundle_size/4 - 1);
+          uint32_t cond_pr6 = ((step > 4) && (step != 8));
+          mlisa_setpred_eqi_PR6(cond_pr6, 1);
+          mlisa_mem_store_NtoS_async_PR6(sram_buf + sram_hffdsum_cur +
+                                         coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                         nram_buf + nram_ffdsum_out_prev,
+                                         sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+          // Switch NRAM and SRAM buffers for the next iteration
+          int tmp = nram_ffd_mlp_in_cur;
+          nram_ffd_mlp_in_cur = nram_ffd_mlp_in_prev;
+          nram_ffd_mlp_in_prev = tmp;
+          tmp = nram_ffd_mlp_out_cur;
+          nram_ffd_mlp_out_cur = nram_ffd_mlp_out_prev;
+          nram_ffd_mlp_out_prev = tmp;
+          tmp = nram_ffdsum_in_cur;
+          nram_ffdsum_in_cur = nram_ffdsum_in_prev;
+          nram_ffdsum_in_prev = tmp;
+          tmp = nram_ffdsum_out_cur;
+          nram_ffdsum_out_cur = nram_ffdsum_out_prev;
+          nram_ffdsum_out_prev = tmp;
+          tmp = sram_hffdout_cur;
+          sram_hffdout_cur = sram_hffdout_prev;
+          sram_hffdout_prev = tmp;
+          tmp = sram_hffdsum_cur;
+          sram_hffdsum_cur = sram_hffdsum_prev;
+          sram_hffdsum_prev = tmp;
+          key_kernel_wram_ptr += HEAD_SIZE * HIDDEN_DIM / 8 / 64;
+          if(step != 2) {
+            int tmp_offset = sram_recv_offset;
+            sram_recv_offset = sram_exld_offset;
+            sram_exld_offset = tmp_offset;
+          }else {
+            sram_exld_offset = SRAM_HINTER_TSR_BUFA1;
+            sram_recv_offset = SRAM_HINTER_TSR_BUFA2;
+          }
+          if(step < FFD_ITER_NUM * 2) {
+            key_kernel_gdram_ptr += HEAD_SIZE * HIDDEN_DIM / 8;
+          }
+        }
+      }
+      mlisa_barrier_cluster();
+      if (batch_num <= 4) {
+        // Move input tensor into NRAM from WRAM for layer normalization
+        __mlvm_memcpy_wram_to_nram_async(nram_buf + NRAM_LN_PRE_TSR_BUF,
+                                         wram_buf + WRAM_TENSOR_BUF,
+                                         sizeof(half) * batch_num * TENSOR_SIZE / TOTAL_CORES);
+      }
+      int dst_cluster_id = ((clusterId + 3) & 3);
+      int sram_remote_buf = SRAM_TSR_BUF0 + clusterId * HEAD_SIZE * 3 +
+                            TENSOR_SIZE/2*bundle_size/4;
+      mlisa_ffd_reshape_StoS_async(sram_buf + sram_remote_buf,
+                                   sram_buf + sram_hffdsum_prev,
+                                   SEQ_LEN/2*bundle_size/4 - 1,
+                                   dst_cluster_id);
+      if (cur_layer == MAX_LAYERS - 1 && coreId == MEM_CORE && batch_num <= 4) {
+        __memcpy(sram_buf + SRAM_TSR_BUF3, post_output_kernel,
+                 sizeof(int16) * HIDDEN_DIM * 2, GDRAM2SRAM);
+      }
+    }
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    mlisa_barrier_all();
+
+    bundle_size = batch_num - 4;
+    if (bundle_size > 0) {
+      //////////////////////////////////////////////////////////////////////////////////////////////
+      { // Send the input tensor in the first buffer to the previous cluster
+        __memcpy(sram_buf + SRAM_TSR_BUF1, sram_buf + SRAM_TSR_BUF4,
+                 sizeof(half) * TENSOR_SIZE * bundle_size/4, SRAM2SRAM, dst_cluster_id);
+
+        // Broadcast tensor from SRAM to IPU0-IPU3 NRAM, the mask is 0xF
+        if(coreId == 0) {
+          mlisa_mem_multicast_StoN_all(nram_buf + NRAM_INTER_MLP_BUF0, sram_buf + SRAM_TSR_BUF4,
+                                       sizeof(half) * TENSOR_SIZE * bundle_size/4);
+        }
+      }
+      //////////////////////////////////////////////////////////////////////////////////////////////
+      { // Produce intermediate output
+        // We reuse the input buffer as the output buffer.
+        // Because of this, the order of buffer load and store must be
+        // carefully handled.
+        int nram_inter_cur  = NRAM_INTER_MLP_BUF0;
+        int nram_inter_prev = NRAM_INTER_MLP_BUF1;
+        int sram_recv_offset = SRAM_TSR_BUF4;
+        int sram_exld_offset = SRAM_TSR_BUF1; // offset of tensor prefetch and exchange
+        int sram_copy_src_cur  = SRAM_INTER_OUT_BUFB0;
+        int sram_copy_src_prev = SRAM_INTER_OUT_BUFB1;
+
+        if(coreId == MEM_CORE) {
+          // Iterations for producing intermediate output (first four batches)
+          // The number of iterations (FFD_ITER_NUM) is determined by clusterDim
+          for (int step = 0; step < FFD_ITER_NUM + 1; step ++) {
+            mlisa_barrier_all();
+            // Exchange input tensor
+            mlisa_setpred_lti_PR0(step, 2);
+            mlisa_tensor_exchange_StoS_async_PR0(sram_buf + sram_recv_offset,
+                                                 sram_buf + sram_exld_offset,
+                                                 TENSOR_SIZE*bundle_size/4*sizeof(half),
+                                                 dst_cluster_id);
+            int dst_copy_offset = SRAM_INTER_TSR_BUFB + clusterId*TENSOR_SIZE/2*bundle_size/4;
+            int dst_copy_id = ((step - 2 + clusterId) & 3);
+            mlisa_setpred_gei_PR1(step, 3);
+            mlisa_tensor_exchange_StoS_async_PR1(sram_buf + dst_copy_offset,
+                                                 sram_buf + sram_copy_src_prev,
+                                                 TENSOR_SIZE/2*bundle_size/4*sizeof(half),
+                                                 dst_copy_id);
+            mlisa_tensor_exchange_StoS_async_PR1(sram_buf + dst_copy_offset + TENSOR_SIZE * 2,
+                                                 sram_buf + sram_copy_src_prev + TENSOR_SIZE / 2,
+                                                 TENSOR_SIZE/2*bundle_size/4*sizeof(half),
+                                                 dst_copy_id);
+            // Switch NRAM and SRAM buffers for the next iteration
+            if(step < 2) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }
+            int tmp = sram_copy_src_cur;
+            sram_copy_src_cur = sram_copy_src_prev;
+            sram_copy_src_prev = tmp;
+          }
+        } else {
+          int sram_reshape_offset = clusterId*TENSOR_SIZE/2*bundle_size/4 + SRAM_INTER_TSR_BUFB +
+                                    coreId * (HIDDEN_DIM / 4);
+          //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 11]; // inter mlp
+          //int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 12]; // inter out
+          int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 12]; // inter mlp
+          int fix_pos1 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 13]; // inter out
+          // Iterations for producing intermediate output (first four batches)
+          // The number of iterations (FFD_ITER_NUM) is determined by clusterDim
+          for (int step = 0; step < FFD_ITER_NUM + 1; step ++) {
+            mlisa_barrier_all();
+            // Producing intermediate output
+            mlisa_setpred_lti_PR3(step, 4);
+            mlisa_inter_mlp_PR3((half*)(nram_buf + NRAM_INTER_OUT_BUF),
+                                (int16*)(nram_buf + nram_inter_cur),
+                                wram_buf + WRAM_KERNEL_INTER_BUF,
+                                nram_buf + NRAM_BIAS_BUF_INTER,
+                                SEQ_LEN/2*bundle_size/4, fix_pos0);
+            // Reshape results to SRAM, batch_front * (32 * 192) -> batch_front * (32 * 768)
+            mlisa_setpred_eqi_PR1(step, 1);
+            mlisa_inter_reshape_NtoS_async_PR1(sram_buf + sram_reshape_offset,
+                                               nram_buf + nram_inter_prev,
+                                               SEQ_LEN/2*bundle_size/4 - 1);
+            mlisa_setpred_gti_PR2(step, 1);
+            mlisa_inter_reshape_NtoS_async_PR2(sram_buf + sram_reshape_offset,
+                                               nram_buf + nram_inter_prev,
+                                               SEQ_LEN/2*bundle_size/4 - 1);
+            mlisa_half2float_PR3((float*) (nram_buf + nram_inter_cur +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  nram_buf + NRAM_INTER_OUT_BUF,
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_inter_reshape_NtoS_async_PR1(sram_buf + sram_reshape_offset +
+                                               TENSOR_SIZE*2,
+                                               nram_buf + nram_inter_prev +
+                                               TENSOR_SIZE/2*bundle_size/4,
+                                               SEQ_LEN/2*bundle_size/4 - 1);
+            mlisa_inter_reshape_NtoS_async_PR2(sram_buf + sram_reshape_offset + TENSOR_SIZE/2,
+                                               nram_buf + nram_inter_prev +
+                                               TENSOR_SIZE/2*bundle_size/4,
+                                               SEQ_LEN/2*bundle_size/4 - 1);
+            mlisa_active_gelu_PR3((float*) (nram_buf + nram_inter_cur +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  (float*) (nram_buf + nram_inter_cur +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_float2half_rd_PR3(nram_buf + nram_inter_cur,
+                                    (float*) (nram_buf + nram_inter_cur +
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_half2int16_rd_PR3((int16*)(nram_buf + nram_inter_cur),
+                                    nram_buf + nram_inter_cur,
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2, fix_pos1);
+            // Load input tensor into NRAM, this must be placed after store
+            //uint32_t cond_pr0 = ((step < 3) && (coreId == 0));
+            mlisa_setpred_lti_PR0(step, 3);
+            mlisa_mem_load_StoN_async_PR0(nram_buf + nram_inter_prev,
+                                          sram_buf + sram_exld_offset,
+                                          TENSOR_SIZE*bundle_size/4*sizeof(half));
+            mlisa_inter_mlp_PR3((half*)(nram_buf + NRAM_INTER_OUT_BUF),
+                                (int16*)(nram_buf + nram_inter_cur +
+                                TENSOR_SIZE/2*bundle_size/4),
+                                wram_buf + WRAM_KERNEL_INTER_BUF,
+                                nram_buf + NRAM_BIAS_BUF_INTER,
+                                SEQ_LEN/2*bundle_size/4, fix_pos0);
+            mlisa_half2float_PR3 ((float*) (nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4 +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  nram_buf + NRAM_INTER_OUT_BUF,
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_active_gelu_PR3((float*) (nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4 +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  (float*) (nram_buf + nram_inter_cur +
+                                  TENSOR_SIZE/2*bundle_size/4 +
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                  HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_float2half_rd_PR3(nram_buf + nram_inter_cur +
+                                    TENSOR_SIZE/2*bundle_size/4,
+                                    (float*) (nram_buf + nram_inter_cur +
+                                    TENSOR_SIZE/2*bundle_size/4 +
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2),
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2);
+            mlisa_half2int16_rd_PR3((int16*)(nram_buf + nram_inter_cur +
+                                    TENSOR_SIZE/2*bundle_size/4),
+                                    nram_buf + nram_inter_cur +
+                                    TENSOR_SIZE/2*bundle_size/4,
+                                    HEAD_SIZE*SEQ_LEN*3*bundle_size/4/2, fix_pos1);
+            // Switch NRAM and SRAM buffers for the next iteration
+            int tmp = nram_inter_cur;
+            nram_inter_cur = nram_inter_prev;
+            nram_inter_prev = tmp;
+            if(step < 2) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }
+            tmp = sram_copy_src_cur;
+            sram_copy_src_cur = sram_copy_src_prev;
+            sram_copy_src_prev = tmp;
+            if(step >= 1) {
+              sram_reshape_offset = sram_copy_src_cur + coreId * (HIDDEN_DIM/4);
+            }
+          }
+        }
+        mlisa_barrier_cluster();
+        int dst_copy_offset = SRAM_INTER_TSR_BUFB +
+                              clusterId*TENSOR_SIZE/2*bundle_size/4;
+        int dst_copy_id = ((3 + clusterId) & 3);
+        __memcpy(sram_buf + dst_copy_offset, sram_buf + sram_copy_src_prev,
+                 TENSOR_SIZE/2*bundle_size/4*sizeof(half), SRAM2SRAM, dst_copy_id);
+        dst_copy_offset = SRAM_INTER_TSR_BUFB + TENSOR_SIZE*2 +
+                          clusterId*TENSOR_SIZE/2*bundle_size/4;
+        __memcpy(sram_buf + dst_copy_offset, sram_buf + sram_copy_src_prev + TENSOR_SIZE/2,
+                 TENSOR_SIZE/2*bundle_size/4*sizeof(half), SRAM2SRAM, dst_copy_id);
+      } // End of intermediate output
+      //////////////////////////////////////////////////////////////////////////////////////////////
+      mlisa_barrier_all();
+
+      //////////////////////////////////////////////////////////////////////////////////////////////
+      {// Send the input tensor in the first buffer to the previous cluster
+        __memcpy(sram_buf + SRAM_HINTER_TSR_BUFB2,
+                 sram_buf + SRAM_HINTER_TSR_BUFB0,
+                 sizeof(half)*TENSOR_SIZE*2*bundle_size/4,
+                 SRAM2SRAM, dst_cluster_id);
+        // Load tensor from SRAM into NRAM
+        int tensor_load_offset = SRAM_HINTER_TSR_BUFB0 +
+                                 coreId*TENSOR_SIZE/2*bundle_size/4;
+        __mlvm_memcpy_sram_to_nram_async(nram_buf + NRAM_FFDIN_BUF0, sram_buf + tensor_load_offset,
+                                         sizeof(half)*TENSOR_SIZE/2*bundle_size/4);
+        // Produce feedforward output
+        int nram_ffd_mlp_in_cur  = NRAM_FFDIN_BUF0;
+        int nram_ffd_mlp_in_prev = NRAM_FFDIN_BUF1;
+        int sram_recv_offset = SRAM_HINTER_TSR_BUFB0;
+        int sram_exld_offset = SRAM_HINTER_TSR_BUFB2; // offset of tensor prefetch and exchange
+        int sram_hffdout_cur  = SRAM_HFFD_OUT_BUFB0;
+        int sram_hffdout_prev = SRAM_HFFD_OUT_BUFB1;
+        int sram_hffdsum_cur  = SRAM_HFFD_SUM_BUFB0;
+        int sram_hffdsum_prev = SRAM_HFFD_SUM_BUFB1;
+        // Partial feedforward out result NRAM buffer
+        int nram_ffd_mlp_out_cur  = NRAM_FFDOUT_BUF0;
+        int nram_ffd_mlp_out_prev = NRAM_FFDOUT_BUF1;
+        // Feedforward partial results reduction NRAM buffer
+        int nram_ffdsum_in_cur  = NRAM_FFDSUM_IN_BUF0;
+        int nram_ffdsum_in_prev = NRAM_FFDSUM_IN_BUF1;
+        int nram_ffdsum_out_cur  = NRAM_FFDSUM_OUT_BUF0;
+        int nram_ffdsum_out_prev = NRAM_FFDSUM_OUT_BUF1;
+        if(coreId == MEM_CORE){
+          int sram_remote_buf = SRAM_TSR_BUF1 + clusterId * HEAD_SIZE * 3;
+          // Iterations for producing feedforward output (first four batches)
+          for (int step = 0; step <= FFD_ITER_NUM * 2 + 3; step ++) {
+            mlisa_barrier_all();
+            uint32_t cond_pr0 = ((step < FFD_ITER_NUM * 2 - 2) && (step != 2));
+            mlisa_setpred_eqi_PR0(cond_pr0, 1);
+            mlisa_tensor_exchange_StoS_async_PR0(sram_buf + sram_recv_offset,
+                                                 sram_buf + sram_exld_offset,
+                                                 sizeof(half)*TENSOR_SIZE*2*bundle_size/4,
+                                                 dst_cluster_id);
+            int dst_cluster_id = ((clusterId + ((step - 5) & 3)) & 3);
+            uint32_t cond_pr1 = ((step >= 6) && (step != 9));
+            mlisa_setpred_eqi_PR1(cond_pr1, 1);
+            mlisa_ffd_reshape_StoS_async_PR1(sram_buf + sram_remote_buf,
+                                             sram_buf + sram_hffdsum_prev,
+                                             SEQ_LEN/2*bundle_size/4 - 1,
+                                             dst_cluster_id);
+            // Switch NRAM and SRAM buffers for the next iteration
+            if(step != 2) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }else {
+              sram_exld_offset = SRAM_HINTER_TSR_BUFB1;
+              sram_recv_offset = SRAM_HINTER_TSR_BUFB2;
+            }
+            if(step == 9) {
+              sram_remote_buf += TENSOR_SIZE/2*bundle_size/4;
+            }
+            int tmp = sram_hffdsum_cur;
+            sram_hffdsum_cur = sram_hffdsum_prev;
+            sram_hffdsum_prev = tmp;
+          }
+        }else {
+          //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 13]; // out mlp
+          int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 14]; // out mlp
+          // Iterations for producing feedforward output (first four batches)
+          __bang_half2float((float*) (nram_buf + NRAM_FFD_BIAS_F32_BUF),
+                            nram_buf + NRAM_BIAS_BUF_FFDOUT, HEAD_SIZE * 3);
+          for (int step = 0; step <= FFD_ITER_NUM * 2 + 3; step ++) {
+            mlisa_barrier_all();
+            // Data prefetch, inter-cluster exchange and async result save
+            mlisa_setpred_lti_PR0(step, FFD_ITER_NUM * 2 - 1);
+            mlisa_mem_load_StoN_async_PR0(nram_buf + nram_ffd_mlp_in_prev,
+                                          sram_buf + sram_exld_offset +
+                                          coreId*TENSOR_SIZE/2*bundle_size/4,
+                                          sizeof(half)*TENSOR_SIZE/2*bundle_size/4);
+            // Producing partial feedforward output
+            mlisa_setpred_lti_PR7(step, FFD_ITER_NUM * 2);
+            mlisa_feedforward_mlp_PR7((half*) (nram_buf + nram_ffd_mlp_out_cur),
+                                      (int16*) nram_buf + nram_ffd_mlp_in_cur,
+                                      wram_buf + WRAM_KERNEL_FFDOUT_BUF,
+                                      SEQ_LEN/2*bundle_size/4, fix_pos0);
+            // Reduce partial feedforward output
+            uint32_t cond_pr1 = ((step >= 2) && (step <= FFD_ITER_NUM * 2 + 1));
+            mlisa_setpred_eqi_PR1(cond_pr1, 1);
+            mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev,
+                                          sram_buf + sram_hffdout_prev +
+                                          coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                          sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                          SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                          sram_buf + sram_hffdout_prev +
+                                          SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4 +
+                                          coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                          sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                          SEQ_LEN*HEAD_SIZE*3/4*bundle_size/4,
+                                          sram_buf + sram_hffdout_prev +
+                                          SEQ_LEN*HEAD_SIZE*3*bundle_size/4 +
+                                          coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                          sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_mem_load_StoN_async_PR1(nram_buf + nram_ffdsum_in_prev +
+                                          SEQ_LEN*HEAD_SIZE*3/8*3*bundle_size/4,
+                                          sram_buf + sram_hffdout_prev +
+                                          SEQ_LEN*HEAD_SIZE*3/2*3*bundle_size/4 +
+                                          coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                          sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            uint32_t cond_pr3 = ((step >= 3) && (step <= FFD_ITER_NUM * 2 + 2));
+            mlisa_setpred_eqi_PR3(cond_pr3, 1);
+            mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                 nram_buf + nram_ffdsum_in_cur,
+                                 SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                 nram_buf + nram_ffdsum_in_cur +
+                                 SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                 SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                     SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                 nram_buf + nram_ffdsum_in_cur +
+                                 SEQ_LEN*HEAD_SIZE*3/4*bundle_size/4,
+                                 SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                     SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_half2float_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                 nram_buf + nram_ffdsum_in_cur +
+                                 SEQ_LEN*HEAD_SIZE*3/8*3*bundle_size/4,
+                                 SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_stream_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                     (float*) (nram_buf + NRAM_FFDSUM_F32_BUF1),
+                                     SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            mlisa_stream_cycle_add_f32_PR3((float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                           (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                           (float*) (nram_buf + NRAM_FFD_BIAS_F32_BUF),
+                                           SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4, HEAD_SIZE * 3);
+            mlisa_float2half_rd_PR3(nram_buf + nram_ffdsum_out_cur,
+                                    (float*) (nram_buf + NRAM_FFDSUM_F32_BUF0),
+                                    SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            uint32_t cond_pr2 = ((step >= 1) && (step <= FFD_ITER_NUM * 2));
+            mlisa_setpred_eqi_PR2(cond_pr2, 1);
+            mlisa_mem_store_NtoS_async_PR2(sram_buf + sram_hffdout_cur +
+                                           coreId*SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4,
+                                           nram_buf + nram_ffd_mlp_out_prev,
+                                           sizeof(half)*SEQ_LEN*HEAD_SIZE*3/2*bundle_size/4);
+            mlisa_setpred_eqi_PR4(step, 4);
+            mlisa_ffd_reshape_NtoS_async_PR4(sram_buf + SRAM_TSR_BUF1 +
+                                             clusterId * HEAD_SIZE * 3 +
+                                             coreId*TENSOR_SIZE/8*bundle_size/4,
+                                             nram_buf + nram_ffdsum_out_prev,
+                                             SEQ_LEN/8*bundle_size/4 - 1);
+            mlisa_setpred_eqi_PR5(step, 8);
+            mlisa_ffd_reshape_NtoS_async_PR5(sram_buf + SRAM_TSR_BUF1 +
+                                             clusterId * HEAD_SIZE * 3 +
+                                             (coreId*TENSOR_SIZE/8+TENSOR_SIZE/2)*
+                                             bundle_size/4,
+                                             nram_buf + nram_ffdsum_out_prev,
+                                             SEQ_LEN/8*bundle_size/4 - 1);
+            uint32_t cond_pr6 = ((step > 4) && (step != 8));
+            mlisa_setpred_eqi_PR6(cond_pr6, 1);
+            mlisa_mem_store_NtoS_async_PR6(sram_buf + sram_hffdsum_cur +
+                                           coreId*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4,
+                                           nram_buf + nram_ffdsum_out_prev,
+                                           sizeof(half)*SEQ_LEN*HEAD_SIZE*3/8*bundle_size/4);
+            // Switch NRAM and SRAM buffers for the next iteration
+            int tmp = nram_ffd_mlp_in_cur;
+            nram_ffd_mlp_in_cur = nram_ffd_mlp_in_prev;
+            nram_ffd_mlp_in_prev = tmp;
+            tmp = nram_ffd_mlp_out_cur;
+            nram_ffd_mlp_out_cur = nram_ffd_mlp_out_prev;
+            nram_ffd_mlp_out_prev = tmp;
+            tmp = nram_ffdsum_in_cur;
+            nram_ffdsum_in_cur = nram_ffdsum_in_prev;
+            nram_ffdsum_in_prev = tmp;
+            tmp = nram_ffdsum_out_cur;
+            nram_ffdsum_out_cur = nram_ffdsum_out_prev;
+            nram_ffdsum_out_prev = tmp;
+            tmp = sram_hffdout_cur;
+            sram_hffdout_cur = sram_hffdout_prev;
+            sram_hffdout_prev = tmp;
+            tmp = sram_hffdsum_cur;
+            sram_hffdsum_cur = sram_hffdsum_prev;
+            sram_hffdsum_prev = tmp;
+            if(step != 2) {
+              int tmp_offset = sram_recv_offset;
+              sram_recv_offset = sram_exld_offset;
+              sram_exld_offset = tmp_offset;
+            }else {
+              sram_exld_offset = SRAM_HINTER_TSR_BUFB1;
+              sram_recv_offset = SRAM_HINTER_TSR_BUFB2;
+            }
+          }
+        }
+        mlisa_barrier_cluster();
+        // Move input tensor into NRAM from WRAM for layer normalization
+        __mlvm_memcpy_wram_to_nram_async(nram_buf + NRAM_LN_PRE_TSR_BUF,
+                                         wram_buf + WRAM_TENSOR_BUF,
+                                         sizeof(half) * batch_num * TENSOR_SIZE / TOTAL_CORES);
+        int dst_cluster_id = ((clusterId + 3) & 3);
+        int sram_remote_buf = SRAM_TSR_BUF1 + clusterId * HEAD_SIZE * 3 +
+                              TENSOR_SIZE/2*bundle_size/4;
+        mlisa_ffd_reshape_StoS_async(sram_buf + sram_remote_buf,
+                                     sram_buf + sram_hffdsum_prev,
+                                     SEQ_LEN/2*bundle_size/4 - 1,
+                                     dst_cluster_id);
+        if (cur_layer == MAX_LAYERS - 1 && coreId == MEM_CORE) {
+          __memcpy(sram_buf + SRAM_TSR_BUF3, post_output_kernel,
+                   sizeof(int16) * HIDDEN_DIM * 2, GDRAM2SRAM);
+        }
+      }
+      mlisa_barrier_all();
+    } // End of (if bundle_size > 0)
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    { // Layer normalization of the feedforward layer
+      value_kernel_gdram_ptr += 3 * HEAD_SIZE * HIDDEN_DIM;
+      int nram_dst_offset = NRAM_LN_CUR_TSR_BUF;
+      int sram_src_offset = SRAM_TSR_BUF0 + coreId * TENSOR_SIZE / TOTAL_CORES;
+      for (int i = 0; i < batch_num; i ++) {
+        __mlvm_memcpy_sram_to_nram_async(nram_buf + nram_dst_offset,
+                                         sram_buf + sram_src_offset,
+                                         sizeof(half) * TENSOR_SIZE / TOTAL_CORES);
+        nram_dst_offset += TENSOR_SIZE / TOTAL_CORES;
+        sram_src_offset += TENSOR_SIZE / CLUSTER_DIM;
+      }
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_LN_BETA_BUF,
+                                        output_layernorm_beta,
+                                        sizeof(half) * HIDDEN_DIM);
+      __mlvm_memcpy_gdram_to_nram_async(nram_buf + NRAM_LN_GAMMA_BUF,
+                                        output_layernorm_gamma,
+                                        sizeof(half) * HIDDEN_DIM);
+      int task_size = TENSOR_SIZE / TOTAL_CORES * batch_num;
+      int channel_size = SEQ_LEN / 4;
+      int cycle_size = TENSOR_SIZE / 4;
+      if (batch_num > 4) {
+        channel_size = SEQ_LEN / 2;
+        cycle_size = TENSOR_SIZE / 2;
+      }
+      //int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 14];
+      int fix_pos0 = -nram_fix_pos[cur_layer * NUM_LAYER_FIXPOS + 15];
+      int cond_pr0 = ((coreId < 3) && (cur_layer < CHECK_LAYER));
+      int cond_pr1 = ((cur_layer == MAX_LAYERS - 1) && (coreId != MEM_CORE));
+      mlisa_setpred_eqi_PR0(cond_pr0, 1);
+      mlisa_setpred_eqi_PR1(cond_pr1, 1);
+      mlisa_sync();
+      __bang_add(nram_buf + NRAM_LN_FP32_BUF,
+                 nram_buf + NRAM_LN_CUR_TSR_BUF,
+                 nram_buf + NRAM_LN_PRE_TSR_BUF,
+                 task_size);
+      mlisa_mem_load_StoW_async_PR1(wram_buf + WRAM_KERNEL_Q_BUF,
+                                    sram_buf + SRAM_TSR_BUF3,
+                                    sizeof(half) * 64 * HIDDEN_DIM);
+      mlisa_load_kernel_GtoW_async_PR0(wram_buf + WRAM_KERNEL_V_BUF,
+                                       value_kernel_gdram_ptr,
+                                       HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __bang_half2float((float*)(nram_buf + NRAM_LN_PRE_TSR_BUF),
+                        nram_buf + NRAM_LN_FP32_BUF, task_size);
+      __bang_transpose((float*) (nram_buf + NRAM_LN_FP32_BUF),
+                       (float*) (nram_buf + NRAM_LN_PRE_TSR_BUF), channel_size, HIDDEN_DIM);
+      mlisa_load_kernel_GtoW_async_PR0(wram_buf + WRAM_KERNEL_V_BUF + HEAD_SIZE * HIDDEN_DIM/4/64,
+                                       value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/4,
+                                       HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      mlisa_mem_load_GtoN_async_PR1(nram_buf + NRAM_BIAS_BUF_POST, post_output_bias,
+                                    sizeof(float) * 2);
+      __bang_avgpool((float*)(nram_buf + NRAM_LN_MEAN_BUF),
+                     (float*)(nram_buf + NRAM_LN_FP32_BUF),
+                     channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+      __bang_cycle_sub((float*)(nram_buf + NRAM_LN_FP32_BUF),
+                       (float*)(nram_buf + NRAM_LN_FP32_BUF), (float*)(nram_buf + NRAM_LN_MEAN_BUF),
+                       cycle_size, channel_size);
+      mlisa_load_kernel_GtoW_async_PR0(wram_buf + WRAM_KERNEL_V_BUF + HEAD_SIZE * HIDDEN_DIM/2/64,
+                                       value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM/2,
+                                       HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __bang_square((float*)(nram_buf + NRAM_LN_FP32_VAR_BUF),
+                    (float*)(nram_buf + NRAM_LN_FP32_BUF), TENSOR_SIZE / 2);
+      __bang_avgpool((float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                     (float*)(nram_buf + NRAM_LN_FP32_VAR_BUF),
+                     channel_size, HIDDEN_DIM, 1, HIDDEN_DIM, 1, 1, 1);
+      __bang_active_rsqrt((float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                          (float*)(nram_buf + NRAM_LN_SVAR_BUF), channel_size);
+      __bang_cycle_mul((float*)(nram_buf + NRAM_LN_FP32_BUF),
+                       (float*)(nram_buf + NRAM_LN_FP32_BUF), (float*)(nram_buf + NRAM_LN_SVAR_BUF),
+                       cycle_size, channel_size);
+      mlisa_load_kernel_GtoW_async_PR0(wram_buf + WRAM_KERNEL_V_BUF +
+                                       HEAD_SIZE * HIDDEN_DIM * 3/4/64,
+                                       value_kernel_gdram_ptr + HEAD_SIZE * HIDDEN_DIM * 3/4,
+                                       HEAD_SIZE * HIDDEN_DIM * sizeof(int16)/4);
+      __bang_transpose((float*) (nram_buf + NRAM_LN_PRE_TSR_BUF),
+                       (float*) (nram_buf + NRAM_LN_FP32_BUF), HIDDEN_DIM, channel_size);
+      __bang_float2half_rd(nram_buf + NRAM_LN_FP32_BUF,
+                           (float*)(nram_buf + NRAM_LN_PRE_TSR_BUF), task_size);
+      __bang_cycle_mul(nram_buf + NRAM_LN_CUR_TSR_BUF,
+                       nram_buf + NRAM_LN_FP32_BUF, nram_buf + NRAM_LN_GAMMA_BUF,
+                       task_size, HIDDEN_DIM);
+      __bang_cycle_add(nram_buf + NRAM_LN_CUR_TSR_BUF,
+                       nram_buf + NRAM_LN_CUR_TSR_BUF, nram_buf + NRAM_LN_BETA_BUF,
+                       task_size, HIDDEN_DIM);
+      if (cur_layer < CHECK_LAYER) {
+        mlisa_sync();
+        __mlvm_memcpy_nram_to_wram_async(wram_buf + WRAM_TENSOR_BUF, nram_buf + NRAM_LN_CUR_TSR_BUF,
+                                         sizeof(half) * task_size);
+      }
+      mlisa_sync();
+      __bang_half2int16_rd((int16*) (nram_buf + NRAM_LN_CUR_TSR_BUF),
+                           nram_buf + NRAM_LN_CUR_TSR_BUF,
+                           task_size, fix_pos0);
+      mlisa_sync();
+    }
+    if(cur_layer < CHECK_LAYER) {
+      int nram_src_offset = NRAM_LN_CUR_TSR_BUF;
+      int sram_dst_offset = SRAM_TSR_BUF2 + coreId * TENSOR_SIZE / TOTAL_CORES;
+      for (int i = 0; i < batch_num; i ++) {
+        __mlvm_memcpy_nram_to_sram_async(sram_buf + sram_dst_offset,
+                                         nram_buf + nram_src_offset,
+                                         sizeof(half) * TENSOR_SIZE / TOTAL_CORES);
+        nram_src_offset += TENSOR_SIZE / TOTAL_CORES;
+        sram_dst_offset += TENSOR_SIZE / CLUSTER_DIM;
+      }
+      attr_bias_Q += HIDDEN_DIM;
+      attr_bias_K += HIDDEN_DIM;
+      attr_bias_V += HIDDEN_DIM;
+      attr_output_bias += HIDDEN_DIM;
+      inter_bias += 4 * HIDDEN_DIM;
+      output_bias += HIDDEN_DIM;
+      attr_layernorm_beta += HIDDEN_DIM;
+      attr_layernorm_gamma += HIDDEN_DIM;
+      output_layernorm_beta += HIDDEN_DIM;
+      output_layernorm_gamma += HIDDEN_DIM;
+      inter_kernel_gdram_ptr += 3 * 3 * HEAD_SIZE * HIDDEN_DIM;
+      attout_kernel_gdram_ptr += 2 * HEAD_SIZE * HIDDEN_DIM;
+      output_kernel_gdram_ptr += 3 * 3 * HEAD_SIZE * HIDDEN_DIM;
+      mlisa_barrier_cluster();
+      if (batch_num >= 1) {
+        __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2, sizeof(half) * TENSOR_SIZE / 4,
+                 SRAM2SRAM, 0);
+      }
+      if (batch_num >= 2) {
+        __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 1);
+      }
+      if (batch_num >= 3) {
+        __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + 2 * TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 2);
+      }
+      if (batch_num >= 4) {
+        __memcpy(sram_buf + SRAM_TSR_BUF0 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + 3 * TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 3);
+      }
+      if (batch_num >= 5) {
+        __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + TENSOR_SIZE,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 0);
+      }
+      if (batch_num >= 6) {
+        __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + 5 * TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 1);
+      }
+      if (batch_num >= 7) {
+        __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + 6 * TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 2);
+      }
+      if (batch_num == 8) {
+        __memcpy(sram_buf + SRAM_TSR_BUF1 + clusterId * TENSOR_SIZE / 4,
+                 sram_buf + SRAM_TSR_BUF2 + 7 * TENSOR_SIZE / 4,
+                 sizeof(half) * TENSOR_SIZE / 4, SRAM2SRAM, 3);
+      }
+    } else {
+      // The final fix position is used for SQuAD post process
+      int fix_pos0 = -nram_fix_pos[NUM_FIXPOS - 1];
+      __bang_conv((float*) (nram_buf + NRAM_LN_FP32_BUF),
+                  (int16*) (nram_buf + NRAM_LN_CUR_TSR_BUF),
+                  (int16*) (wram_buf + WRAM_KERNEL_Q_BUF),
+                  (float*) (nram_buf + NRAM_BIAS_BUF_POST),
+                  HIDDEN_DIM, 1, batch_num*SEQ_LEN/TOTAL_CORES,
+                  1, 1, 1, 1, 64, fix_pos0);
+      /*int output_size = batch_num * SEQ_LEN / TOTAL_CORES * 64;
+      __bang_half2float((float*) (nram_buf + NRAM_LN_PRE_TSR_BUF),
+                        nram_buf + NRAM_LN_FP32_BUF, output_size);*/
+      int global_core_id = CLUSTER_DIM * clusterId + coreId;
+      int gdram_offset = SEQ_LEN/TOTAL_CORES * global_core_id;
+      //int nram_offset = NRAM_LN_PRE_TSR_BUF;
+      int nram_offset = NRAM_LN_FP32_BUF;
+      for (int i = 0; i < batch_num; i ++) {
+        __memcpy(start_logits + gdram_offset,
+                 (float*) (nram_buf + nram_offset),
+                 sizeof(float), NRAM2GDRAM,
+                 sizeof(float),
+                 sizeof(float) * 64, SEQ_LEN/TOTAL_CORES - 1);
+        __memcpy(end_logits + gdram_offset,
+                 (float*) (nram_buf + nram_offset + 2),
+                 sizeof(float), NRAM2GDRAM,
+                 sizeof(float),
+                 sizeof(float) * 64, SEQ_LEN/TOTAL_CORES - 1);
+        gdram_offset += SEQ_LEN;
+        nram_offset += SEQ_LEN/TOTAL_CORES * 64 * 2;
+      }
+    }
+  }
+  #ifdef COLLECT_LAYER_RUNTIME
+  mlisa_barrier_all();
+  tick_ee = mlisa_get_tck_low();
+  if(clusterId == 0 && coreId == 0) {
+    printf("CHECKPOINT TIME = %u cycles(ns).\n", tick_ee - tick_ss);
+  }
+  #endif
+
+  /*int gdram_offset = clusterId * TENSOR_SIZE / 4;
+  int sram_offset = SRAM_TSR_BUF0;
+  for (int i = 0; i < batch_num; i ++) {
+    __memcpy(encoder_out + gdram_offset, sram_buf + sram_offset,
+             sizeof(half) * TENSOR_SIZE/4, SRAM2GDRAM);
+    gdram_offset += TENSOR_SIZE;
+    sram_offset += TENSOR_SIZE/4;
+  }*/
+}
